@@ -46,5 +46,8 @@
   "publishConfig": {
     "access": "public",
     "provenance": true
+  },
+  "dependencies": {
+    "fs-ext-extra-prebuilt": "^2.2.14"
   }
 }

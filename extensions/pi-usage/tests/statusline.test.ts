@@ -25,6 +25,7 @@ import type {
   ProviderUsageSnapshotV1,
   QueryUsageResult,
 } from "../src/types.js";
+import { startPausedCacheWriter, stopChild, waitForMutationPhase } from "./cache-process.js";
 
 const NOW = Date.parse("2026-09-12T13:00:00Z");
 const codexModel = { provider: "openai-codex", id: "gpt-5", name: "GPT-5" };
@@ -225,6 +226,34 @@ void test("a foreign lease suppresses duplicate refresh and retries at lease exp
     assert.equal(queryCalls, 0);
     assert.equal(statuses.at(-1), "codex 23% 5h (4m old)");
     assert.equal(timers.at(-1)?.delayMs, REFRESH_LEASE_MS - 5_000);
+  });
+});
+
+void test("mutation-lock contention fails bounded without starting provider network work", async () => {
+  await withHarness(async ({ cacheFile, timers, setQuery }) => {
+    const controlFile = `${cacheFile}.control`;
+    const child = startPausedCacheWriter(cacheFile, NOW, "anthropic", "after-acquire", controlFile);
+    let queryCalls = 0;
+    setQuery(async () => {
+      queryCalls += 1;
+      return { ok: true, report: codexReport() };
+    });
+
+    try {
+      await waitForMutationPhase(child, controlFile, "after-acquire");
+      const statuses: Array<string | undefined> = [];
+      const startedAt = performance.now();
+
+      await refreshCurrentUsageStatusline(context(codexModel, statuses), codexModel);
+
+      const waitMs = performance.now() - startedAt;
+      assert.ok(waitMs < 1_000, `lock contention was not bounded: ${waitMs}ms`);
+      assert.equal(queryCalls, 0);
+      assert.equal(statuses.at(-1), "checking");
+      assert.equal(timers.at(-1)?.delayMs, REFRESH_LEASE_MS);
+    } finally {
+      await stopChild(child);
+    }
   });
 });
 

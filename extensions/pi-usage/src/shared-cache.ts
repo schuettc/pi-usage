@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { hostname } from "node:os";
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { flockSync } from "fs-ext-extra-prebuilt";
 import {
   CACHE_TTL_MS,
   RATE_LIMIT_BACKOFF_MAX_MS,
@@ -16,11 +16,14 @@ const MUTATION_LOCK_RETRY_MS = 5;
 const MUTATION_LOCK_ATTEMPTS = 11;
 const mutationLockWaitArray = new Int32Array(new SharedArrayBuffer(4));
 
+export type MutationLockPhase = "after-open" | "after-acquire" | "before-cache-replace" | "after-cache-replace";
+
 type SharedCacheRuntime = {
   cacheFile: string;
   now: () => number;
   rename: typeof renameSync;
   randomUUID: () => string;
+  mutationLockPhase?: (phase: MutationLockPhase) => void;
 };
 
 const defaultRuntime: SharedCacheRuntime = {
@@ -28,6 +31,7 @@ const defaultRuntime: SharedCacheRuntime = {
   now: Date.now,
   rename: renameSync,
   randomUUID,
+  mutationLockPhase: undefined,
 };
 let runtime = defaultRuntime;
 
@@ -171,156 +175,89 @@ export function readSharedUsageCache(): SharedUsageCache | undefined {
   }
 }
 
-type MutationLockMetadata = {
-  pid: number;
-  token: string;
-  hostname: string;
-  acquiredAt: number;
-};
+type MutationLock = { descriptor: number };
 
-type MutationLock = MutationLockMetadata & { lockFile: string };
-
-function isMutationLockMetadata(value: unknown): value is MutationLockMetadata {
-  return (
-    isRecord(value) &&
-    Number.isInteger(value.pid) &&
-    (value.pid as number) > 0 &&
-    typeof value.token === "string" &&
-    value.token.length > 0 &&
-    typeof value.hostname === "string" &&
-    value.hostname.length > 0 &&
-    typeof value.acquiredAt === "number" &&
-    Number.isFinite(value.acquiredAt)
-  );
-}
-
-function readMutationLockMetadata(lockFile: string): MutationLockMetadata | undefined {
-  try {
-    const contents: unknown = JSON.parse(readFileSync(lockFile, "utf8"));
-    return isMutationLockMetadata(contents) ? contents : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function sameMutationLock(left: MutationLockMetadata, right: MutationLockMetadata): boolean {
-  return left.pid === right.pid && left.token === right.token && left.hostname === right.hostname;
-}
-
-function ownsMutationLock(lock: MutationLock): boolean {
-  const current = readMutationLockMetadata(lock.lockFile);
-  return current !== undefined && sameMutationLock(current, lock);
-}
-
-function isProvablyDeadLocalOwner(metadata: MutationLockMetadata): boolean {
-  if (metadata.hostname !== hostname()) return false;
-  try {
-    process.kill(metadata.pid, 0);
-    return false;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ESRCH";
-  }
-}
-
-function recoverAbandonedMutationLock(lockFile: string): boolean {
-  const observed = readMutationLockMetadata(lockFile);
-  if (!observed || !isProvablyDeadLocalOwner(observed)) return false;
-
-  const abandonedFile = `${lockFile}.abandoned.${process.pid}.${runtime.randomUUID()}`;
-  try {
-    runtime.rename(lockFile, abandonedFile);
-    const displaced = readMutationLockMetadata(abandonedFile);
-    if (!displaced || !sameMutationLock(displaced, observed)) {
-      try {
-        runtime.rename(abandonedFile, lockFile);
-      } catch {
-        // A contender may already own the canonical lock path. Leave the
-        // displaced file intact rather than deleting an unverified owner.
-      }
-      return false;
-    }
-    rmSync(abandonedFile, { force: true });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
+/**
+ * The lock path is a permanent rendezvous inode: this module never renames or
+ * unlinks it. flock ownership belongs to the open file description, so the
+ * kernel releases it on close or process death. There is consequently no
+ * stale-owner metadata, PID liveness decision, or takeover path to race.
+ */
 function tryAcquireMutationLock(): MutationLock | undefined {
-  const lockFile = `${runtime.cacheFile}.lock`;
   try {
     mkdirSync(dirname(runtime.cacheFile), { recursive: true });
   } catch {
     return undefined;
   }
 
-  let abandonedRecoveryAttempted = false;
+  let descriptor: number;
+  try {
+    descriptor = openSync(`${runtime.cacheFile}.lock`, "a+");
+    runtime.mutationLockPhase?.("after-open");
+  } catch {
+    return undefined;
+  }
+
   for (let attempt = 0; attempt < MUTATION_LOCK_ATTEMPTS; attempt += 1) {
-    const lock: MutationLock = {
-      lockFile,
-      pid: process.pid,
-      token: runtime.randomUUID(),
-      hostname: hostname(),
-      acquiredAt: runtime.now(),
-    };
-    let descriptor: number | undefined;
     try {
-      descriptor = openSync(lockFile, "wx");
-      writeFileSync(descriptor, JSON.stringify(lock, ["pid", "token", "hostname", "acquiredAt"]));
-      closeSync(descriptor);
-      descriptor = undefined;
-      return lock;
-    } catch (error) {
-      if (descriptor !== undefined) {
+      flockSync(descriptor, "exnb");
+      runtime.mutationLockPhase?.("after-acquire");
+      return { descriptor };
+    } catch {
+      if (attempt + 1 >= MUTATION_LOCK_ATTEMPTS) {
         try {
           closeSync(descriptor);
         } catch {
-          // The descriptor may already have been closed after a successful write.
+          // The descriptor may have failed independently of lock contention.
         }
-        if (ownsMutationLock(lock)) {
-          try {
-            unlinkSync(lockFile);
-          } catch {
-            // Best-effort cleanup of the lock this attempt created.
-          }
-        }
+        return undefined;
       }
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") return undefined;
-      if (!abandonedRecoveryAttempted) {
-        abandonedRecoveryAttempted = true;
-        if (recoverAbandonedMutationLock(lockFile)) continue;
-      }
-      if (attempt + 1 >= MUTATION_LOCK_ATTEMPTS) return undefined;
       Atomics.wait(mutationLockWaitArray, 0, 0, MUTATION_LOCK_RETRY_MS);
     }
   }
   return undefined;
 }
 
-function releaseMutationLock(lock: MutationLock): void {
+function verifyMutationLock(lock: MutationLock): boolean {
   try {
-    if (!ownsMutationLock(lock)) return;
-    unlinkSync(lock.lockFile);
+    // Reasserting LOCK_EX|LOCK_NB on the same open file description is an
+    // atomic kernel ownership check. The descriptor remains locked across the
+    // following rename, so there is no reusable-path check/use window.
+    flockSync(lock.descriptor, "exnb");
+    return true;
   } catch {
-    // Best-effort — an abandoned lock is recovered only after its local PID
-    // is provably dead.
+    return false;
   }
 }
 
-function writeCacheAtomically(cacheFile: SharedUsageCache): boolean {
+function releaseMutationLock(lock: MutationLock): void {
+  try {
+    // Closing the open file description releases flock ownership even if an
+    // explicit unlock would fail. A process crash performs the same cleanup.
+    closeSync(lock.descriptor);
+  } catch {
+    // Best-effort: the descriptor is either already closed or will be closed
+    // automatically when this process exits.
+  }
+}
+
+function writeCacheAtomically(cacheFile: SharedUsageCache, lock: MutationLock): boolean {
   const tmpFile = `${runtime.cacheFile}.${process.pid}.${runtime.randomUUID()}.tmp`;
   try {
     writeFileSync(tmpFile, JSON.stringify(cacheFile));
+    if (!verifyMutationLock(lock)) return false;
+    runtime.mutationLockPhase?.("before-cache-replace");
     runtime.rename(tmpFile, runtime.cacheFile);
+    runtime.mutationLockPhase?.("after-cache-replace");
     return true;
   } catch {
+    return false;
+  } finally {
     try {
       rmSync(tmpFile, { force: true });
     } catch {
       // Best-effort cleanup.
     }
-    return false;
   }
 }
 
@@ -333,8 +270,7 @@ function mutateSharedUsageCache<T>(fallback: T, mutate: (cacheFile: SharedUsageC
     const cacheFile = readSharedUsageCache() ?? { version: SHARED_CACHE_VERSION, entries: {} };
     const mutation = mutate(cacheFile);
     if (!mutation.changed) return mutation.value;
-    if (!ownsMutationLock(lock)) return fallback;
-    return writeCacheAtomically(cacheFile) ? mutation.value : fallback;
+    return writeCacheAtomically(cacheFile, lock) ? mutation.value : fallback;
   } catch {
     return fallback;
   } finally {

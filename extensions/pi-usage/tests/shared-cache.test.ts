@@ -1,10 +1,8 @@
 import assert from "node:assert/strict";
-import { type ChildProcess, fork } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
 import { CACHE_TTL_MS, REFRESH_LEASE_MS } from "../src/constants.js";
 import {
   configureSharedCacheForTests,
@@ -14,12 +12,21 @@ import {
   saveSharedUsageReport,
   tryAcquireRefreshLease,
 } from "../src/shared-cache.js";
-import type { CodexUsageReport, SharedUsageCache } from "../src/types.js";
+import type { AnthropicUsageReport, CodexUsageReport, SharedUsageCache } from "../src/types.js";
+import {
+  resumeMutationPhase,
+  startCacheWriter,
+  startPausedCacheWriter,
+  stopChild,
+  waitForChildExit,
+  waitForChildMessage,
+  waitForMutationPhase,
+} from "./cache-process.js";
 
 const NOW = Date.parse("2026-09-12T13:00:00Z");
 const model = { provider: "openai-codex", id: "gpt-5", name: "GPT-5" };
 
-function report(capturedAt = NOW): CodexUsageReport {
+function report(capturedAt = NOW, usedPercent = 23): CodexUsageReport {
   return {
     provider: "codex",
     source: "codex-app-server",
@@ -27,9 +34,20 @@ function report(capturedAt = NOW): CodexUsageReport {
     snapshots: [
       {
         limitId: "codex",
-        primary: { usedPercent: 23, windowMinutes: 300 },
+        primary: { usedPercent, windowMinutes: 300 },
       },
     ],
+  };
+}
+
+function anthropicReport(capturedAt = NOW): AnthropicUsageReport {
+  return {
+    provider: "anthropic",
+    source: "anthropic-oauth",
+    capturedAt,
+    windows: [],
+    summaryLines: ["Anthropic usage"],
+    statusline: "Claude usage",
   };
 }
 
@@ -55,58 +73,6 @@ async function withCacheAsync(run: (cacheFile: string) => Promise<void>): Promis
     configureSharedCacheForTests();
     rmSync(directory, { recursive: true, force: true });
   }
-}
-
-const childFixture = fileURLToPath(new URL("./fixtures/shared-cache-child.ts", import.meta.url));
-const packageDirectory = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
-
-function startCacheChild(
-  mode: "hold-lock" | "write",
-  cacheFile: string,
-  provider?: "codex" | "anthropic",
-): ChildProcess {
-  return fork(childFixture, [mode, cacheFile, String(NOW), ...(provider ? [provider] : [])], {
-    cwd: packageDirectory,
-    execArgv: ["--import", "tsx"],
-    stdio: ["ignore", "ignore", "pipe", "ipc"],
-  });
-}
-
-function waitForChildMessage(child: ChildProcess, type: "ready" | "done"): Promise<void> {
-  return new Promise((resolve, reject) => {
-    let stderr = "";
-    child.stderr?.on("data", (chunk) => {
-      stderr += String(chunk);
-    });
-    const timeout = setTimeout(() => finish(new Error(`child timed out waiting for ${type}`)), 10_000);
-    const onMessage = (message: unknown) => {
-      if (typeof message === "object" && message !== null && Reflect.get(message, "type") === type) finish();
-    };
-    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
-      finish(new Error(`child exited before ${type}: code=${String(code)} signal=${String(signal)} ${stderr}`));
-    };
-    const finish = (error?: Error) => {
-      clearTimeout(timeout);
-      child.off("message", onMessage);
-      child.off("exit", onExit);
-      if (error) reject(error);
-      else resolve();
-    };
-    child.on("message", onMessage);
-    child.on("exit", onExit);
-  });
-}
-
-function waitForChildExit(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
-  return new Promise((resolve) => child.once("exit", () => resolve()));
-}
-
-async function stopChild(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  const exited = waitForChildExit(child);
-  child.kill("SIGTERM");
-  await exited;
 }
 
 void test("malformed and version-1 cache files fail closed", () => {
@@ -211,29 +177,109 @@ void test("only the matching owner can release a refresh lease", () => {
   });
 });
 
-void test("an aged companion lock held by a live child is not stolen and is recoverable after exit", async () => {
-  await withCacheAsync(async (cacheFile) => {
-    const child = startCacheChild("hold-lock", cacheFile);
-    try {
-      await waitForChildMessage(child, "ready");
-      const staleTime = new Date(NOW - 60_000);
-      utimesSync(`${cacheFile}.lock`, staleTime, staleTime);
+void test("malformed legacy metadata and PID reuse cannot block the stable mutation lock", () => {
+  withCache((cacheFile) => {
+    const lockFile = `${cacheFile}.lock`;
+    writeFileSync(lockFile, "{partial metadata");
+    const originalInode = statSync(lockFile).ino;
 
-      assert.equal(tryAcquireRefreshLease("codex", "parent", NOW), false);
+    saveSharedUsageReport(report(), NOW);
+    assert.equal(readSharedUsageCache()?.entries.codex?.report.provider, "codex");
+    assert.equal(statSync(lockFile).ino, originalInode);
+
+    writeFileSync(
+      lockFile,
+      JSON.stringify({
+        pid: process.pid,
+        token: "reused-pid",
+        hostname: hostname(),
+        acquiredAt: NOW,
+      }),
+    );
+    saveSharedUsageReport(anthropicReport(), NOW);
+
+    assert.equal(statSync(lockFile).ino, originalInode);
+    assert.equal(readSharedUsageCache()?.entries.anthropic?.report.provider, "anthropic");
+  });
+});
+
+void test("a pre-replacement holder fences a bounded contender and preserves both provider updates", async () => {
+  await withCacheAsync(async (cacheFile) => {
+    const controlFile = `${cacheFile}.control`;
+    const codexChild = startPausedCacheWriter(cacheFile, NOW, "codex", "before-cache-replace", controlFile);
+    try {
+      await waitForMutationPhase(codexChild, controlFile, "before-cache-replace");
+
+      const startedAt = performance.now();
+      saveSharedUsageReport(anthropicReport(), NOW);
+      const waitMs = performance.now() - startedAt;
+
+      assert.ok(waitMs < 1_000, `lock contention was not bounded: ${waitMs}ms`);
       assert.equal(readSharedUsageCache(), undefined);
 
+      const codexDone = waitForChildMessage(codexChild, "done");
+      resumeMutationPhase(controlFile, "before-cache-replace");
+      await codexDone;
+      await waitForChildExit(codexChild);
+
+      saveSharedUsageReport(anthropicReport(), NOW);
+      const shared = readSharedUsageCache();
+      assert.equal(shared?.entries.codex?.report.provider, "codex");
+      assert.equal(shared?.entries.anthropic?.report.provider, "anthropic");
+    } finally {
+      await stopChild(codexChild);
+    }
+  });
+});
+
+void test("process death during acquisition automatically releases mutation ownership", async () => {
+  await withCacheAsync(async (cacheFile) => {
+    const controlFile = `${cacheFile}.control`;
+    const child = startPausedCacheWriter(cacheFile, NOW, "codex", "after-acquire", controlFile);
+    try {
+      await waitForMutationPhase(child, controlFile, "after-acquire");
       await stopChild(child);
-      assert.equal(tryAcquireRefreshLease("codex", "parent", NOW), true);
+
+      saveSharedUsageReport(anthropicReport(), NOW);
+      assert.equal(readSharedUsageCache()?.entries.anthropic?.report.provider, "anthropic");
     } finally {
       await stopChild(child);
     }
   });
 });
 
+void test("process death immediately before and after replacement cannot strand or corrupt the cache", async () => {
+  for (const phase of ["before-cache-replace", "after-cache-replace"] as const) {
+    await withCacheAsync(async (cacheFile) => {
+      saveSharedUsageReport(report(), NOW);
+      const controlFile = `${cacheFile}.control`;
+      const child = startPausedCacheWriter(cacheFile, NOW, "anthropic", phase, controlFile);
+      try {
+        await waitForMutationPhase(child, controlFile, phase);
+
+        saveSharedUsageReport(report(NOW + 1, 91), NOW + 1);
+        const whileHeld = readSharedUsageCache();
+        assert.equal(whileHeld?.entries.codex?.report.snapshots[0]?.primary?.usedPercent, 23);
+        assert.equal(whileHeld?.entries.anthropic !== undefined, phase === "after-cache-replace");
+
+        await stopChild(child);
+        saveSharedUsageReport(report(NOW + 1, 91), NOW + 1);
+
+        const recovered = readSharedUsageCache();
+        assert.equal(recovered?.entries.codex?.report.snapshots[0]?.primary?.usedPercent, 91);
+        assert.equal(recovered?.entries.anthropic !== undefined, phase === "after-cache-replace");
+        assert.doesNotThrow(() => JSON.parse(readFileSync(cacheFile, "utf8")));
+      } finally {
+        await stopChild(child);
+      }
+    });
+  }
+});
+
 void test("concurrent child writers preserve both provider updates", async () => {
   await withCacheAsync(async (cacheFile) => {
-    const codexChild = startCacheChild("write", cacheFile, "codex");
-    const anthropicChild = startCacheChild("write", cacheFile, "anthropic");
+    const codexChild = startCacheWriter(cacheFile, NOW, "codex");
+    const anthropicChild = startCacheWriter(cacheFile, NOW, "anthropic");
     try {
       await Promise.all([waitForChildMessage(codexChild, "ready"), waitForChildMessage(anthropicChild, "ready")]);
       const codexDone = waitForChildMessage(codexChild, "done");
