@@ -1,15 +1,6 @@
 import { randomUUID } from "node:crypto";
-import {
-  closeSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  statSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { dirname } from "node:path";
 import {
   CACHE_TTL_MS,
@@ -21,7 +12,6 @@ import {
 import { reportMatchesModel } from "./models.js";
 import type { ProviderUsageModel, SharedCacheEntry, SharedUsageCache, UsageProviderKey, UsageReport } from "./types.js";
 
-const MUTATION_LOCK_STALE_MS = 10_000;
 const MUTATION_LOCK_RETRY_MS = 5;
 const MUTATION_LOCK_ATTEMPTS = 11;
 const mutationLockWaitArray = new Int32Array(new SharedArrayBuffer(4));
@@ -84,12 +74,21 @@ function isCodexWindow(value: unknown): boolean {
   );
 }
 
+function isNormalizedCredits(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.hasCredits === "boolean" &&
+    typeof value.unlimited === "boolean" &&
+    (value.balance === undefined || typeof value.balance === "string")
+  );
+}
+
 function isCodexSnapshot(value: unknown): boolean {
   if (!isRecord(value) || typeof value.limitId !== "string") return false;
   if (value.limitName !== undefined && typeof value.limitName !== "string") return false;
   if (value.primary !== undefined && !isCodexWindow(value.primary)) return false;
   if (value.secondary !== undefined && !isCodexWindow(value.secondary)) return false;
-  return value.credits === undefined || isRecord(value.credits);
+  return value.credits === undefined || isNormalizedCredits(value.credits);
 }
 
 function isUsageReport(value: unknown, provider: UsageProviderKey): value is UsageReport {
@@ -172,15 +171,75 @@ export function readSharedUsageCache(): SharedUsageCache | undefined {
   }
 }
 
-type MutationLock = { lockFile: string; owner: string };
+type MutationLockMetadata = {
+  pid: number;
+  token: string;
+  hostname: string;
+  acquiredAt: number;
+};
 
-function recoverStaleMutationLock(lockFile: string): boolean {
+type MutationLock = MutationLockMetadata & { lockFile: string };
+
+function isMutationLockMetadata(value: unknown): value is MutationLockMetadata {
+  return (
+    isRecord(value) &&
+    Number.isInteger(value.pid) &&
+    (value.pid as number) > 0 &&
+    typeof value.token === "string" &&
+    value.token.length > 0 &&
+    typeof value.hostname === "string" &&
+    value.hostname.length > 0 &&
+    typeof value.acquiredAt === "number" &&
+    Number.isFinite(value.acquiredAt)
+  );
+}
+
+function readMutationLockMetadata(lockFile: string): MutationLockMetadata | undefined {
   try {
-    const ageMs = runtime.now() - statSync(lockFile).mtimeMs;
-    if (!Number.isFinite(ageMs) || ageMs <= MUTATION_LOCK_STALE_MS) return false;
-    const staleFile = `${lockFile}.stale.${process.pid}.${runtime.randomUUID()}`;
-    runtime.rename(lockFile, staleFile);
-    rmSync(staleFile, { force: true });
+    const contents: unknown = JSON.parse(readFileSync(lockFile, "utf8"));
+    return isMutationLockMetadata(contents) ? contents : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sameMutationLock(left: MutationLockMetadata, right: MutationLockMetadata): boolean {
+  return left.pid === right.pid && left.token === right.token && left.hostname === right.hostname;
+}
+
+function ownsMutationLock(lock: MutationLock): boolean {
+  const current = readMutationLockMetadata(lock.lockFile);
+  return current !== undefined && sameMutationLock(current, lock);
+}
+
+function isProvablyDeadLocalOwner(metadata: MutationLockMetadata): boolean {
+  if (metadata.hostname !== hostname()) return false;
+  try {
+    process.kill(metadata.pid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
+function recoverAbandonedMutationLock(lockFile: string): boolean {
+  const observed = readMutationLockMetadata(lockFile);
+  if (!observed || !isProvablyDeadLocalOwner(observed)) return false;
+
+  const abandonedFile = `${lockFile}.abandoned.${process.pid}.${runtime.randomUUID()}`;
+  try {
+    runtime.rename(lockFile, abandonedFile);
+    const displaced = readMutationLockMetadata(abandonedFile);
+    if (!displaced || !sameMutationLock(displaced, observed)) {
+      try {
+        runtime.rename(abandonedFile, lockFile);
+      } catch {
+        // A contender may already own the canonical lock path. Leave the
+        // displaced file intact rather than deleting an unverified owner.
+      }
+      return false;
+    }
+    rmSync(abandonedFile, { force: true });
     return true;
   } catch {
     return false;
@@ -195,15 +254,22 @@ function tryAcquireMutationLock(): MutationLock | undefined {
     return undefined;
   }
 
-  let staleRecoveryAttempted = false;
+  let abandonedRecoveryAttempted = false;
   for (let attempt = 0; attempt < MUTATION_LOCK_ATTEMPTS; attempt += 1) {
-    const owner = `${process.pid}:${runtime.randomUUID()}`;
+    const lock: MutationLock = {
+      lockFile,
+      pid: process.pid,
+      token: runtime.randomUUID(),
+      hostname: hostname(),
+      acquiredAt: runtime.now(),
+    };
     let descriptor: number | undefined;
     try {
       descriptor = openSync(lockFile, "wx");
-      writeFileSync(descriptor, JSON.stringify({ owner, acquiredAt: runtime.now() }));
+      writeFileSync(descriptor, JSON.stringify(lock, ["pid", "token", "hostname", "acquiredAt"]));
       closeSync(descriptor);
-      return { lockFile, owner };
+      descriptor = undefined;
+      return lock;
     } catch (error) {
       if (descriptor !== undefined) {
         try {
@@ -211,17 +277,19 @@ function tryAcquireMutationLock(): MutationLock | undefined {
         } catch {
           // The descriptor may already have been closed after a successful write.
         }
-        try {
-          unlinkSync(lockFile);
-        } catch {
-          // Best-effort cleanup.
+        if (ownsMutationLock(lock)) {
+          try {
+            unlinkSync(lockFile);
+          } catch {
+            // Best-effort cleanup of the lock this attempt created.
+          }
         }
       }
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "EEXIST") return undefined;
-      if (!staleRecoveryAttempted) {
-        staleRecoveryAttempted = true;
-        if (recoverStaleMutationLock(lockFile)) continue;
+      if (!abandonedRecoveryAttempted) {
+        abandonedRecoveryAttempted = true;
+        if (recoverAbandonedMutationLock(lockFile)) continue;
       }
       if (attempt + 1 >= MUTATION_LOCK_ATTEMPTS) return undefined;
       Atomics.wait(mutationLockWaitArray, 0, 0, MUTATION_LOCK_RETRY_MS);
@@ -232,11 +300,11 @@ function tryAcquireMutationLock(): MutationLock | undefined {
 
 function releaseMutationLock(lock: MutationLock): void {
   try {
-    const contents: unknown = JSON.parse(readFileSync(lock.lockFile, "utf8"));
-    if (!isRecord(contents) || contents.owner !== lock.owner) return;
+    if (!ownsMutationLock(lock)) return;
     unlinkSync(lock.lockFile);
   } catch {
-    // Best-effort — a stale lock is recovered by a later bounded acquisition.
+    // Best-effort — an abandoned lock is recovered only after its local PID
+    // is provably dead.
   }
 }
 
@@ -265,6 +333,7 @@ function mutateSharedUsageCache<T>(fallback: T, mutate: (cacheFile: SharedUsageC
     const cacheFile = readSharedUsageCache() ?? { version: SHARED_CACHE_VERSION, entries: {} };
     const mutation = mutate(cacheFile);
     if (!mutation.changed) return mutation.value;
+    if (!ownsMutationLock(lock)) return fallback;
     return writeCacheAtomically(cacheFile) ? mutation.value : fallback;
   } catch {
     return fallback;
@@ -273,12 +342,16 @@ function mutateSharedUsageCache<T>(fallback: T, mutate: (cacheFile: SharedUsageC
   }
 }
 
-export function saveSharedUsageReport(report: UsageReport, now: number = Date.now()): void {
+export function saveSharedUsageReport(
+  report: UsageReport,
+  now: number = Date.now(),
+  backoffProvider: UsageProviderKey = report.provider,
+): void {
   if (!Number.isFinite(now)) return;
   mutateSharedUsageCache(undefined, (cacheFile) => {
     cacheFile.entries[report.provider] = { createdAt: now, report };
     if (cacheFile.backoffUntil) {
-      delete cacheFile.backoffUntil[report.provider];
+      delete cacheFile.backoffUntil[backoffProvider];
       if (Object.keys(cacheFile.backoffUntil).length === 0) cacheFile.backoffUntil = undefined;
     }
     return { changed: true, value: undefined };

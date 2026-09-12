@@ -35,8 +35,9 @@ function adapter(
   id: string,
   modelProviders: string[] = ["bridge-provider"],
   refresh: ProviderUsageAdapterV1["refresh"] = async () => usageSnapshot(),
+  usageProvider: ProviderUsageAdapterV1["usageProvider"] = "codex",
 ): ProviderUsageAdapterV1 {
-  return { id, modelProviders, refresh };
+  return { id, usageProvider, modelProviders, refresh };
 }
 
 async function withCleanBus(run: () => void | Promise<void>): Promise<void> {
@@ -214,10 +215,15 @@ void test("supports and queries a non-native model through its adapter", async (
 void test("keeps a successful claude-bridge adapter report selected in the statusline", async () => {
   await withCleanBus(async () => {
     getUsageBusV1().register(
-      adapter("claude-bridge-adapter", ["claude-bridge"], async () => ({
-        ...usageSnapshot(64),
-        provider: "anthropic",
-      })),
+      adapter(
+        "claude-bridge-adapter",
+        ["claude-bridge"],
+        async () => ({
+          ...usageSnapshot(64),
+          provider: "anthropic",
+        }),
+        "anthropic",
+      ),
     );
     const statuses: Array<string | undefined> = [];
     const ctx = {

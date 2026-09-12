@@ -28,6 +28,7 @@ import type {
   ProviderUsageModel,
   ProviderUsageSnapshotV1,
   QueryUsageResult,
+  UsageProviderKey,
   UsageReport,
 } from "./types.js";
 import { formatAgeShort } from "./utils.js";
@@ -56,6 +57,7 @@ let statuslineRequestId = 0;
 let sessionActive = false;
 let activeStatuslineContext: ExtensionContext | undefined;
 let activeModelProvider: string | undefined;
+const activeRefreshProviders = new Set<UsageProviderKey>();
 
 export function isSessionActive(): boolean {
   return sessionActive;
@@ -95,6 +97,7 @@ export function configureStatuslineForTests(overrides: Partial<StatuslineRuntime
   sessionActive = false;
   activeStatuslineContext = undefined;
   activeModelProvider = undefined;
+  activeRefreshProviders.clear();
 }
 
 export function handleStaleContextError(ctx: ExtensionContext, error: unknown): boolean {
@@ -220,6 +223,17 @@ function clearRefreshTimer(): void {
   statuslineRefreshTimer = undefined;
 }
 
+function usageProviderForModel(model: ProviderUsageModel): UsageProviderKey {
+  if (model.provider === ANTHROPIC_PROVIDER_ID || model.provider === CODEX_PROVIDER_ID) {
+    return providerKeyForModel(model);
+  }
+  return (
+    getUsageBusV1()
+      .adapters()
+      .find((adapter) => adapter.modelProviders.includes(model.provider))?.usageProvider ?? providerKeyForModel(model)
+  );
+}
+
 export async function refreshCurrentUsageStatusline(ctx: ExtensionContext, model?: ProviderUsageModel): Promise<void> {
   if (!sessionActive) return;
   activeStatuslineContext = ctx;
@@ -256,8 +270,9 @@ export async function refreshCurrentUsageStatusline(ctx: ExtensionContext, model
     return;
   }
 
-  // Respect a shared rate-limit backoff set by any session.
-  const providerKey = providerKeyForModel(selectedModel);
+  // Resolve external adapters to their semantic usage provider before any
+  // backoff or lease decision. Model provider IDs alone are not sufficient.
+  const providerKey = usageProviderForModel(selectedModel);
   const backoffRemaining = sharedBackoffRemainingMs(providerKey, now);
   if (backoffRemaining > 0) {
     if (cached) {
@@ -274,10 +289,16 @@ export async function refreshCurrentUsageStatusline(ctx: ExtensionContext, model
   }
 
   // The mutation lock used inside this call is released before any provider
-  // work starts. The persisted lease remains visible to other processes.
-  if (!tryAcquireRefreshLease(providerKey, refreshLeaseOwner, now)) {
+  // work starts. The persisted lease remains visible to other processes. The
+  // in-memory fence outlives the persisted lease so a long poll cannot
+  // reacquire with this process-wide owner and later release its newer lease.
+  const activeInThisProcess = activeRefreshProviders.has(providerKey);
+  if (activeInThisProcess || !tryAcquireRefreshLease(providerKey, refreshLeaseOwner, now)) {
     const leaseExpiry = readSharedUsageCache()?.refreshLeases?.[providerKey]?.expiresAt;
-    const retryDelayMs = Math.max(1, (leaseExpiry ?? now + REFRESH_LEASE_MS) - now);
+    const retryDelayMs =
+      activeInThisProcess && (leaseExpiry === undefined || leaseExpiry <= now)
+        ? REFRESH_LEASE_MS
+        : Math.max(1, (leaseExpiry ?? now + REFRESH_LEASE_MS) - now);
     if (cached) {
       setUsageStatusline(ctx, cached.report, {
         autoRefresh: true,
@@ -291,6 +312,7 @@ export async function refreshCurrentUsageStatusline(ctx: ExtensionContext, model
     return;
   }
 
+  activeRefreshProviders.add(providerKey);
   let result: QueryUsageResult;
   let rateLimited = false;
   let retryDelayMs = CACHE_TTL_MS;
@@ -314,7 +336,7 @@ export async function refreshCurrentUsageStatusline(ctx: ExtensionContext, model
     const completedAt = runtime.now();
     if (result.ok) {
       cache = { createdAt: completedAt, report: result.report };
-      saveSharedUsageReport(result.report, completedAt);
+      saveSharedUsageReport(result.report, completedAt, providerKey);
     } else {
       rateLimited = result.errors.some((error) => isRateLimitErrorMessage(error.message));
       // Honor the server's Retry-After when it sends one; fall back to default.
@@ -323,6 +345,7 @@ export async function refreshCurrentUsageStatusline(ctx: ExtensionContext, model
     }
   } finally {
     releaseRefreshLease(providerKey, refreshLeaseOwner);
+    activeRefreshProviders.delete(providerKey);
   }
 
   if (!sessionActive || requestId !== statuslineRequestId) return;
@@ -370,7 +393,12 @@ export function applyProviderUsageSnapshot(ctx: ExtensionContext, snapshot: Prov
   try {
     const selectedAdapter = getUsageBusV1()
       .adapters()
-      .find((adapter) => ctx.model !== undefined && adapter.modelProviders.includes(ctx.model.provider));
+      .find(
+        (adapter) =>
+          adapter.usageProvider === snapshot.provider &&
+          ctx.model !== undefined &&
+          adapter.modelProviders.includes(ctx.model.provider),
+      );
     const nativeProvider = snapshot.provider === "anthropic" ? ANTHROPIC_PROVIDER_ID : CODEX_PROVIDER_ID;
     const modelProviders = [...new Set([...(selectedAdapter?.modelProviders ?? []), nativeProvider])];
     const report = normalizeExternalUsageSnapshot(snapshot, modelProviders);

@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { type ChildProcess, fork } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { CACHE_TTL_MS, REFRESH_LEASE_MS } from "../src/constants.js";
 import {
   configureSharedCacheForTests,
@@ -43,6 +45,70 @@ function withCache(run: (cacheFile: string) => void): void {
   }
 }
 
+async function withCacheAsync(run: (cacheFile: string) => Promise<void>): Promise<void> {
+  const directory = mkdtempSync(join(tmpdir(), "pi-usage-cache-test-"));
+  const cacheFile = join(directory, "usage-cache.json");
+  configureSharedCacheForTests({ cacheFile, now: () => NOW });
+  try {
+    await run(cacheFile);
+  } finally {
+    configureSharedCacheForTests();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+const childFixture = fileURLToPath(new URL("./fixtures/shared-cache-child.ts", import.meta.url));
+const packageDirectory = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
+
+function startCacheChild(
+  mode: "hold-lock" | "write",
+  cacheFile: string,
+  provider?: "codex" | "anthropic",
+): ChildProcess {
+  return fork(childFixture, [mode, cacheFile, String(NOW), ...(provider ? [provider] : [])], {
+    cwd: packageDirectory,
+    execArgv: ["--import", "tsx"],
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
+  });
+}
+
+function waitForChildMessage(child: ChildProcess, type: "ready" | "done"): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    const timeout = setTimeout(() => finish(new Error(`child timed out waiting for ${type}`)), 10_000);
+    const onMessage = (message: unknown) => {
+      if (typeof message === "object" && message !== null && Reflect.get(message, "type") === type) finish();
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      finish(new Error(`child exited before ${type}: code=${String(code)} signal=${String(signal)} ${stderr}`));
+    };
+    const finish = (error?: Error) => {
+      clearTimeout(timeout);
+      child.off("message", onMessage);
+      child.off("exit", onExit);
+      if (error) reject(error);
+      else resolve();
+    };
+    child.on("message", onMessage);
+    child.on("exit", onExit);
+  });
+}
+
+function waitForChildExit(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => child.once("exit", () => resolve()));
+}
+
+async function stopChild(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = waitForChildExit(child);
+  child.kill("SIGTERM");
+  await exited;
+}
+
 void test("malformed and version-1 cache files fail closed", () => {
   withCache((cacheFile) => {
     writeFileSync(cacheFile, "{not-json");
@@ -57,6 +123,30 @@ void test("malformed and version-1 cache files fail closed", () => {
           codex: {
             createdAt: NOW,
             report: { provider: "codex", source: "codex-app-server", capturedAt: NOW, snapshots: [null] },
+          },
+        },
+      }),
+    );
+    assert.equal(readSharedUsageCache(), undefined);
+
+    writeFileSync(
+      cacheFile,
+      JSON.stringify({
+        version: 2,
+        entries: {
+          codex: {
+            createdAt: NOW,
+            report: {
+              provider: "codex",
+              source: "codex-app-server",
+              capturedAt: NOW,
+              snapshots: [
+                {
+                  limitId: "codex",
+                  credits: { hasCredits: true, unlimited: false, balance: { amount: "12.34" } },
+                },
+              ],
+            },
           },
         },
       }),
@@ -121,17 +211,44 @@ void test("only the matching owner can release a refresh lease", () => {
   });
 });
 
-void test("the companion mutation lock blocks acquisition and recovers when stale", () => {
-  withCache((cacheFile) => {
-    const lockFile = `${cacheFile}.lock`;
-    writeFileSync(lockFile, JSON.stringify({ owner: "other", acquiredAt: NOW }));
+void test("an aged companion lock held by a live child is not stolen and is recoverable after exit", async () => {
+  await withCacheAsync(async (cacheFile) => {
+    const child = startCacheChild("hold-lock", cacheFile);
+    try {
+      await waitForChildMessage(child, "ready");
+      const staleTime = new Date(NOW - 60_000);
+      utimesSync(`${cacheFile}.lock`, staleTime, staleTime);
 
-    assert.equal(tryAcquireRefreshLease("codex", "owner", NOW), false);
-    assert.equal(readSharedUsageCache(), undefined);
+      assert.equal(tryAcquireRefreshLease("codex", "parent", NOW), false);
+      assert.equal(readSharedUsageCache(), undefined);
 
-    const staleTime = new Date(NOW - 60_000);
-    utimesSync(lockFile, staleTime, staleTime);
-    assert.equal(tryAcquireRefreshLease("codex", "owner", NOW), true);
+      await stopChild(child);
+      assert.equal(tryAcquireRefreshLease("codex", "parent", NOW), true);
+    } finally {
+      await stopChild(child);
+    }
+  });
+});
+
+void test("concurrent child writers preserve both provider updates", async () => {
+  await withCacheAsync(async (cacheFile) => {
+    const codexChild = startCacheChild("write", cacheFile, "codex");
+    const anthropicChild = startCacheChild("write", cacheFile, "anthropic");
+    try {
+      await Promise.all([waitForChildMessage(codexChild, "ready"), waitForChildMessage(anthropicChild, "ready")]);
+      const codexDone = waitForChildMessage(codexChild, "done");
+      const anthropicDone = waitForChildMessage(anthropicChild, "done");
+      codexChild.send("write");
+      anthropicChild.send("write");
+      await Promise.all([codexDone, anthropicDone]);
+      await Promise.all([waitForChildExit(codexChild), waitForChildExit(anthropicChild)]);
+
+      const shared = readSharedUsageCache();
+      assert.equal(shared?.entries.codex?.report.provider, "codex");
+      assert.equal(shared?.entries.anthropic?.report.provider, "anthropic");
+    } finally {
+      await Promise.all([stopChild(codexChild), stopChild(anthropicChild)]);
+    }
   });
 });
 

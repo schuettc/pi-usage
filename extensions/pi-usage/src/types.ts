@@ -78,6 +78,7 @@ export type ProviderUsageEventV1 =
 
 export type ProviderUsageAdapterV1 = {
   id: string;
+  usageProvider: "anthropic" | "codex";
   modelProviders: string[];
   refresh(options: { timeoutMs: number; signal?: AbortSignal }): Promise<ProviderUsageSnapshotV1>;
 };
