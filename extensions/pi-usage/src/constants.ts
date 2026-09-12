@@ -12,6 +12,7 @@ export const CODEX_OPENAI_BETA = "codex-1";
 export const ANTHROPIC_OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 export const DEFAULT_TIMEOUT_MS = 15_000;
 export const CACHE_TTL_MS = 3 * 60 * 1000;
+export const REFRESH_LEASE_MS = 30_000;
 export const STATUSLINE_RETRY_ATTEMPTS = 3;
 export const STATUSLINE_RETRY_DELAY_MS = 1_000;
 /** Default backoff after a 429 when the server doesn't say when to retry. */
@@ -21,7 +22,7 @@ export const RATE_LIMIT_BACKOFF_MIN_MS = 30 * 1000;
 export const RATE_LIMIT_BACKOFF_MAX_MS = 60 * 60 * 1000;
 /** Shared on-disk usage cache so concurrent pi sessions don't each hit the APIs. */
 export const SHARED_CACHE_FILE = join(homedir(), ".pi", "agent", "usage-cache.json");
-export const SHARED_CACHE_VERSION = 1;
+export const SHARED_CACHE_VERSION = 2;
 export const STATUS_KEY = "provider-usage";
 export const BAR_SEGMENTS = 20;
 export const LIMIT_VALUE_COLUMN = 29;

@@ -267,9 +267,10 @@ export type UsageProviderKey = "codex" | "anthropic";
 export type SharedCacheEntry = { createdAt: number; report: UsageReport };
 
 export type SharedUsageCache = {
-  version: number;
-  entries: Partial<Record<UsageProviderKey, SharedCacheEntry>>;
-  backoffUntil?: Partial<Record<UsageProviderKey, number>>;
+  version: 2;
+  entries: Partial<Record<"codex" | "anthropic", SharedCacheEntry>>;
+  backoffUntil?: Partial<Record<"codex" | "anthropic", number>>;
+  refreshLeases?: Partial<Record<"codex" | "anthropic", { owner: string; expiresAt: number }>>;
 };
 
 export type FooterTheme = {
