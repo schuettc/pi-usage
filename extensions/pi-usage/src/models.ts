@@ -21,7 +21,7 @@ export function isUsageSupportedModel(model: Pick<PiModel, "provider"> | undefin
 export function reportMatchesModel(report: UsageReport, model: Pick<PiModel, "provider"> | undefined): boolean {
   if (!model) return false;
   if (report.source === "external-adapter") {
-    return report.provider === "codex" ? isOpenAICodexModel(model) : isAnthropicModel(model);
+    return report.modelProviders.includes(model.provider);
   }
   if (report.provider === "codex") return isOpenAICodexModel(model);
   return isAnthropicModel(model);

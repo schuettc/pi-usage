@@ -93,6 +93,7 @@ export type ProviderUsageBusV1 = {
 export type AdapterUsageReport = {
   provider: "anthropic" | "codex";
   source: "external-adapter";
+  modelProviders: string[];
   capturedAt: number;
   windows: NormalizedUsageWindow[];
 };

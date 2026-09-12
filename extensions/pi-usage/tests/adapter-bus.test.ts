@@ -4,6 +4,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getUsageBusV1 } from "../src/adapter-bus.js";
 import { isUsageSupportedModel } from "../src/models.js";
 import { queryUsage } from "../src/query.js";
+import { applyCurrentProviderStatusline, clearUsageStatusline } from "../src/statusline.js";
 import type {
   ProviderUsageAdapterV1,
   ProviderUsageBusV1,
@@ -129,12 +130,48 @@ void test("publishes to subscribers and returns the listener count", async () =>
   });
 });
 
+void test("continues publishing after a listener throws and returns every invocation", async () => {
+  await withCleanBus(() => {
+    const bus = getUsageBusV1();
+    const received: string[] = [];
+    bus.subscribe(() => {
+      received.push("throwing");
+      throw new Error("listener failed");
+    });
+    bus.subscribe(() => received.push("later"));
+    const event: ProviderUsageEventV1 = { version: 1, type: "snapshot", snapshot: usageSnapshot() };
+
+    assert.equal(bus.publish(event), 2);
+    assert.deepEqual(received, ["throwing", "later"]);
+  });
+});
+
 void test("rejects an incompatible preexisting global bus version", async () => {
   await withCleanBus(() => {
     globalRegistry[BUS_SYMBOL] = { version: 2 };
 
     assert.throws(() => getUsageBusV1(), /incompatible.*version.*2/i);
     assert.deepEqual(globalRegistry[BUS_SYMBOL], { version: 2 });
+  });
+});
+
+void test("rejects a version-1 global missing any required bus method", async () => {
+  await withCleanBus(() => {
+    const compatible: ProviderUsageBusV1 = {
+      version: 1,
+      register: () => () => {},
+      adapters: () => [],
+      subscribe: () => () => {},
+      publish: () => 0,
+    };
+
+    globalRegistry[BUS_SYMBOL] = { version: 1 };
+    assert.throws(() => getUsageBusV1(), /incompatible.*register/i);
+
+    for (const method of ["register", "adapters", "subscribe", "publish"] as const) {
+      globalRegistry[BUS_SYMBOL] = { ...compatible, [method]: undefined };
+      assert.throws(() => getUsageBusV1(), new RegExp(`incompatible.*${method}`, "i"));
+    }
   });
 });
 
@@ -159,6 +196,7 @@ void test("supports and queries a non-native model through its adapter", async (
       report: {
         provider: "codex",
         source: "external-adapter",
+        modelProviders: ["bridge-provider"],
         capturedAt: Date.parse("2026-09-12T13:00:00Z"),
         windows: [
           {
@@ -170,6 +208,47 @@ void test("supports and queries a non-native model through its adapter", async (
         ],
       },
     });
+  });
+});
+
+void test("keeps a successful claude-bridge adapter report selected in the statusline", async () => {
+  await withCleanBus(async () => {
+    getUsageBusV1().register(
+      adapter("claude-bridge-adapter", ["claude-bridge"], async () => ({
+        ...usageSnapshot(64),
+        provider: "anthropic",
+      })),
+    );
+    const statuses: Array<string | undefined> = [];
+    const ctx = {
+      model: { provider: "claude-bridge", id: "claude-sonnet", name: "Claude Sonnet" },
+      ui: {
+        setStatus: (_key: string, value: string | undefined) => statuses.push(value),
+      },
+    } as unknown as ExtensionContext;
+
+    const result = await queryUsage(ctx, { timeoutMs: 4321 });
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+
+    assert.deepEqual(result.report, {
+      provider: "anthropic",
+      source: "external-adapter",
+      modelProviders: ["claude-bridge"],
+      capturedAt: Date.parse("2026-09-12T13:00:00Z"),
+      windows: [
+        {
+          id: "gpt:five_hour",
+          label: "5h",
+          usedPercent: 64,
+          scope: { kind: "account" },
+        },
+      ],
+    });
+    assert.equal(applyCurrentProviderStatusline(ctx, [result.report]), true);
+    assert.deepEqual(statuses, ["Claude · 5h 64%"]);
+
+    clearUsageStatusline(ctx);
   });
 });
 

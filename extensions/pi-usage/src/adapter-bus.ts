@@ -6,9 +6,17 @@ const globalRegistry = globalThis as typeof globalThis & Record<symbol, unknown>
 export function getUsageBusV1(): ProviderUsageBusV1 {
   const existing = globalRegistry[PROVIDER_USAGE_BUS_SYMBOL];
   if (existing !== undefined) {
-    const version = typeof existing === "object" && existing !== null ? Reflect.get(existing, "version") : undefined;
+    if (typeof existing !== "object" || existing === null) {
+      throw new Error("Incompatible provider usage bus version undefined; expected version 1.");
+    }
+    const version = Reflect.get(existing, "version");
     if (version !== 1) {
       throw new Error(`Incompatible provider usage bus version ${String(version)}; expected version 1.`);
+    }
+    for (const method of ["register", "adapters", "subscribe", "publish"] as const) {
+      if (typeof Reflect.get(existing, method) !== "function") {
+        throw new Error(`Incompatible provider usage bus version 1: ${method} must be a function.`);
+      }
     }
     return existing as ProviderUsageBusV1;
   }
@@ -45,8 +53,12 @@ function createUsageBusV1(): ProviderUsageBusV1 {
     publish(event) {
       let invoked = 0;
       for (const listener of [...listeners]) {
-        listener(event);
         invoked += 1;
+        try {
+          listener(event);
+        } catch {
+          // Listener failures are isolated so every snapshot subscriber is attempted.
+        }
       }
       return invoked;
     },

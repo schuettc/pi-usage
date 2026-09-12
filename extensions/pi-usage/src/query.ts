@@ -111,7 +111,7 @@ export async function queryUsage(
 
     try {
       const snapshot = await adapter.refresh({ timeoutMs: options.timeoutMs });
-      return { ok: true, report: normalizeExternalUsageSnapshot(snapshot) };
+      return { ok: true, report: normalizeExternalUsageSnapshot(snapshot, adapter.modelProviders) };
     } catch (cause) {
       return {
         ok: false,
