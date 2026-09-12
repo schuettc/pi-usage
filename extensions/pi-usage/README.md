@@ -1,4 +1,4 @@
-# @sreetej510/pi-usage
+# @schuettc/pi-usage
 
 A [pi](https://github.com/earendil-works/pi) coding agent extension that reports provider
 usage / rate-limit budgets — OpenAI Codex, Anthropic OAuth, and pi-auth-backed providers — via
@@ -14,6 +14,14 @@ usage / rate-limit budgets — OpenAI Codex, Anthropic OAuth, and pi-auth-backed
   on rate limits (`429`).
 - Shows the next Codex banked-reset expiry and supports confirmed, interactive consumption.
 
+## Provider support
+- OpenAI Codex through Pi auth, with the Codex app-server fallback.
+- Anthropic OAuth through Pi auth.
+- Optional provider adapters discovered at runtime. No Schuettc package is required.
+
+## Shared state
+Snapshots are cached at `~/.pi/agent/usage-cache.json`. The cache contains usage percentages and reset times, never access tokens.
+
 ## Commands
 
 | Command | Effect |
@@ -27,14 +35,14 @@ usage / rate-limit budgets — OpenAI Codex, Anthropic OAuth, and pi-auth-backed
 ## Install
 
 ```bash
-npm install -g @sreetej510/pi-usage
+npm install -g @schuettc/pi-usage
 ```
 
 Then add it to your pi `settings.json`:
 
 ```json
 {
-  "packages": ["npm:@sreetej510/pi-usage"]
+  "packages": ["npm:@schuettc/pi-usage"]
 }
 ```
 
@@ -77,6 +85,6 @@ Or, for local development, point at the file directly:
 
 ```bash
 npm install
-npm run --workspace @sreetej510/pi-usage check     # biome + typecheck
-npm run --workspace @sreetej510/pi-usage format
+npm run --workspace @schuettc/pi-usage check     # biome + typecheck
+npm run --workspace @schuettc/pi-usage format
 ```
