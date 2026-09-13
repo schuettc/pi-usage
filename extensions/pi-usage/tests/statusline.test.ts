@@ -142,6 +142,75 @@ void test("fresh disk cache renders synchronously without starting a provider qu
   });
 });
 
+void test("fresh partial adapter cache renders immediately but still refreshes account usage", async () => {
+  await withHarness(async ({ setQuery }) => {
+    const model = { provider: "claude-bridge", id: "claude-sonnet", name: "Claude Sonnet" };
+    const partial: ProviderUsageSnapshotV1 = {
+      version: 1,
+      provider: "claude",
+      providerLabel: "Claude",
+      source: "claude-code-rate-limit-event",
+      capturedAt: NOW - 1_000,
+      complete: false,
+      adapterId: "schuettc.pi-claude-bridge",
+      windows: [{ id: "five_hour", label: "5h", usedPercent: 23, scope: { kind: "account" } }],
+    };
+    const complete: ProviderUsageSnapshotV1 = {
+      ...partial,
+      source: "claude-code-sdk",
+      capturedAt: NOW,
+      complete: true,
+      windows: [
+        { id: "five_hour", label: "5h", usedPercent: 24, scope: { kind: "account" } },
+        { id: "seven_day", label: "7d", usedPercent: 41, scope: { kind: "account" } },
+      ],
+    };
+    const unregister = getUsageBusV1().register({
+      id: "schuettc.pi-claude-bridge",
+      usageProvider: "claude",
+      modelProviders: ["claude-bridge"],
+      refresh: async () => complete,
+    });
+    let resolveQuery!: (result: QueryUsageResult) => void;
+    let queryCalls = 0;
+    setQuery(
+      () =>
+        new Promise((resolve) => {
+          queryCalls += 1;
+          resolveQuery = resolve;
+        }),
+    );
+
+    try {
+      applyProviderUsageSnapshot(context(model, []), partial);
+      const statuses: Array<string | undefined> = [];
+      const refresh = refreshCurrentUsageStatusline(context(model, statuses), model);
+
+      assert.equal(queryCalls, 1);
+      assert.equal(statuses.at(-1), "Claude · 5h 23%");
+
+      resolveQuery({
+        ok: true,
+        report: {
+          provider: "claude",
+          source: "external-adapter",
+          snapshotSource: complete.source,
+          complete: true,
+          adapterId: complete.adapterId,
+          providerLabel: complete.providerLabel,
+          modelProviders: ["claude-bridge", "anthropic"],
+          capturedAt: complete.capturedAt,
+          windows: complete.windows,
+        },
+      });
+      await refresh;
+      assert.equal(readSharedUsageCache()?.entries.claude?.report.complete, true);
+    } finally {
+      unregister();
+    }
+  });
+});
+
 void test("malformed cached credits fail closed without crashing statusline rendering", async () => {
   await withHarness(async ({ cacheFile, setQuery }) => {
     let queryCalls = 0;

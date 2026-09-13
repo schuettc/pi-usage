@@ -284,7 +284,8 @@ export async function refreshCurrentUsageStatusline(ctx: ExtensionContext, model
   const now = runtime.now();
   const cached = getCachedReportForModel(selectedModel, now);
   const cacheAgeMs = cached ? now - cached.createdAt : Number.POSITIVE_INFINITY;
-  const freshCached = cached && cacheAgeMs >= 0 && cacheAgeMs < CACHE_TTL_MS ? cached : undefined;
+  const cacheIsComplete = cached?.report.source !== "external-adapter" || cached.report.complete;
+  const freshCached = cached && cacheIsComplete && cacheAgeMs >= 0 && cacheAgeMs < CACHE_TTL_MS ? cached : undefined;
   // Fresh cache is always good enough — avoids double-fetching when /usage
   // just updated it or another pi session already fetched. The scheduled
   // timer fires when the TTL actually expires.
