@@ -335,21 +335,20 @@ run_sync() {
   release_tag="pi-usage-v$version"
 
   if [ "${PI_USAGE_SYNC_DRY_RUN:-0}" = '1' ]; then
-    printf 'DRY_RUN: git push --force-with-lease origin HEAD:%s\n' "$PUBLICATION_BRANCH"
-    printf 'DRY_RUN: git tag and push %s\n' "$release_tag"
-    printf 'DRY_RUN: move and push %s to %s\n' "$UPSTREAM_TAG" "$upstream_tip"
+    printf 'DRY_RUN: would create %s and move %s to %s locally\n' "$release_tag" "$UPSTREAM_TAG" "$upstream_tip"
+    printf 'DRY_RUN: git push --atomic with exact leases for %s and %s; create %s\n' "$PUBLICATION_BRANCH" "$UPSTREAM_TAG" "$release_tag"
   else
-    git -C "$sync_worktree" push \
-      --force-with-lease="refs/heads/$PUBLICATION_BRANCH:$publication_tip" \
-      origin "HEAD:refs/heads/$PUBLICATION_BRANCH"
     git -C "$sync_worktree" -c user.name='pi-usage sync' -c user.email='actions@users.noreply.github.com' \
-      tag -a "$release_tag" -m "$PACKAGE_NAME@$version"
-    git -C "$sync_worktree" push origin "refs/tags/$release_tag"
+      tag -f -a "$release_tag" "$result_commit" -m "$PACKAGE_NAME@$version"
     git -C "$sync_worktree" -c user.name='pi-usage sync' -c user.email='actions@users.noreply.github.com' \
       tag -f -a "$UPSTREAM_TAG" "$upstream_tip" -m "Upstream base for $PACKAGE_NAME@$version"
-    git -C "$sync_worktree" push \
+    git -C "$sync_worktree" push --atomic \
+      --force-with-lease="refs/heads/$PUBLICATION_BRANCH:$publication_tip" \
       --force-with-lease="refs/tags/$UPSTREAM_TAG:$base_tag_object" \
-      origin "refs/tags/$UPSTREAM_TAG"
+      origin \
+      "HEAD:refs/heads/$PUBLICATION_BRANCH" \
+      "refs/tags/$release_tag:refs/tags/$release_tag" \
+      "refs/tags/$UPSTREAM_TAG:refs/tags/$UPSTREAM_TAG"
   fi
 
   cleanup_sync
@@ -377,6 +376,51 @@ assert_contains() {
     printf 'fixture assertion failed: %s (missing %q in %s)\n' "$message" "$text" "$path" >&2
     return 1
   fi
+}
+
+assert_not_contains() {
+  local path="$1"
+  local text="$2"
+  local message="$3"
+  if grep -Fq -- "$text" "$path"; then
+    printf 'fixture assertion failed: %s (unexpected %q in %s)\n' "$message" "$text" "$path" >&2
+    return 1
+  fi
+}
+
+assert_before() {
+  local path="$1"
+  local first="$2"
+  local second="$3"
+  local message="$4"
+  local first_line second_line
+  first_line="$(grep -nF -- "$first" "$path" | head -1 | cut -d: -f1)"
+  second_line="$(grep -nF -- "$second" "$path" | head -1 | cut -d: -f1)"
+  if [ -z "$first_line" ] || [ -z "$second_line" ] || [ "$first_line" -ge "$second_line" ]; then
+    printf 'fixture assertion failed: %s\n' "$message" >&2
+    return 1
+  fi
+}
+
+assert_workflow_contracts() {
+  local workflows_directory sync_workflow publish_workflow
+  workflows_directory="$(cd "$(dirname "$SCRIPT_PATH")/../workflows" && pwd)"
+  sync_workflow="$workflows_directory/upstream-sync.yml"
+  publish_workflow="$workflows_directory/publish-pi-usage.yml"
+
+  assert_contains "$sync_workflow" 'if: always() && failure()' 'failure reporting considers every prior step'
+  assert_contains "$sync_workflow" 'gh issue' 'failure reporting uses gh without relying on checkout'
+  assert_contains "$sync_workflow" 'if: success()' 'failure issue closes only after complete success'
+  assert_not_contains "$sync_workflow" 'continue-on-error:' 'step failures remain visible to failure()'
+
+  # These are literal GitHub Actions and shell expressions in the workflow file.
+  # shellcheck disable=SC2016
+  assert_contains "$publish_workflow" 'RELEASE_TAG: ${{ github.ref_name }}' 'publish validation reads the triggering tag exactly'
+  # shellcheck disable=SC2016
+  assert_contains "$publish_workflow" 'expected_tag="pi-usage-v${package_version}"' 'publish validation derives the expected tag from package.version'
+  # shellcheck disable=SC2016
+  assert_contains "$publish_workflow" 'if [ "$RELEASE_TAG" != "$expected_tag" ]; then' 'publish validation rejects a mismatched tag'
+  assert_before "$publish_workflow" 'name: Verify release tag matches package version' 'run: npm ci' 'release tag validation runs before install, tests, and publish'
 }
 
 fixture_git() {
@@ -428,7 +472,22 @@ fixture_run_sync() {
   ) >"$output" 2>&1
 }
 
+fixture_run_sync_publish() {
+  local repository="$1"
+  local lookup="$2"
+  local lookup_log="$3"
+  local output="$4"
+  (
+    cd "$repository"
+    PI_USAGE_NPM_VERSION_LOOKUP="$lookup" \
+      PI_USAGE_LOOKUP_LOG="$lookup_log" \
+      bash "$SCRIPT_PATH"
+  ) >"$output" 2>&1
+}
+
 run_fixture_tests() {
+  assert_workflow_contracts
+
   local fixture_root
   fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/pi-usage-sync-fixture.XXXXXX")"
   FIXTURE_CLEANUP_ROOT="$fixture_root"
@@ -542,6 +601,32 @@ LOOKUP
   assert_eq "$base_commit" "$(git ls-remote "$origin_bare" "refs/tags/$UPSTREAM_TAG^{}" | awk '{print $1}')" 'dry-run did not move the upstream-base tag'
   if fixture_git "$runner" show-ref --verify --quiet 'refs/tags/pi-usage-v1.1.0-schuettc.8'; then
     fail 'fixture assertion failed: dry-run created a release tag'
+  fi
+
+  local release_tag='pi-usage-v1.1.0-schuettc.8'
+  fixture_git "$fork" tag -a "$release_tag" "$prior_release" -m 'fixture rejected release tag'
+  fixture_git "$fork" push -q origin "refs/tags/$release_tag"
+  local rejected_release_object
+  rejected_release_object="$(git ls-remote "$origin_bare" "refs/tags/$release_tag" | awk '{print $1}')"
+
+  if fixture_run_sync_publish "$runner" "$lookup" "$lookup_log" "$output"; then
+    fail 'fixture assertion failed: publication unexpectedly accepted an existing release tag'
+  fi
+  assert_eq "$prior_release" "$(git ls-remote "$origin_bare" "refs/heads/$PUBLICATION_BRANCH" | awk '{print $1}')" 'rejected atomic publication did not move the publication branch'
+  assert_eq "$base_commit" "$(git ls-remote "$origin_bare" "refs/tags/$UPSTREAM_TAG^{}" | awk '{print $1}')" 'rejected atomic publication did not move the upstream-base tag'
+  assert_eq "$rejected_release_object" "$(git ls-remote "$origin_bare" "refs/tags/$release_tag" | awk '{print $1}')" 'rejected atomic publication did not alter the existing release tag'
+
+  fixture_git "$fork" push -q origin ":refs/tags/$release_tag"
+  if ! fixture_run_sync_publish "$runner" "$lookup" "$lookup_log" "$output"; then
+    cat "$output" >&2
+    return 1
+  fi
+  local published_commit
+  published_commit="$(git ls-remote "$origin_bare" "refs/heads/$PUBLICATION_BRANCH" | awk '{print $1}')"
+  assert_eq "$upstream_tip" "$(git ls-remote "$origin_bare" "refs/tags/$UPSTREAM_TAG^{}" | awk '{print $1}')" 'successful atomic publication moved the upstream-base tag'
+  assert_eq "$published_commit" "$(git ls-remote "$origin_bare" "refs/tags/$release_tag^{}" | awk '{print $1}')" 'successful atomic publication moved the branch and release tag together'
+  if [ "$published_commit" = "$prior_release" ]; then
+    fail 'fixture assertion failed: successful atomic publication did not move the publication branch'
   fi
 
   printf 'dirty\n' > "$runner/dirty.txt"
