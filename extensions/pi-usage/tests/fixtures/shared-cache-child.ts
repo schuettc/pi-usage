@@ -39,7 +39,7 @@ function usageReport(provider: UsageProviderKey): UsageReport {
 }
 
 if (mode === "write" || mode === "paused-write") {
-  if (rawProvider !== "codex" && rawProvider !== "anthropic") {
+  if (rawProvider !== "codex" && rawProvider !== "claude") {
     throw new Error("shared-cache writer requires a provider");
   }
   const provider: UsageProviderKey = rawProvider;

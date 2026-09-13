@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: '17 8 * * *'
   workflow_dispatch:
+    inputs:
+      force_publish:
+        description: Rebuild and publish the current patch stack even when upstream has not moved
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -23,6 +29,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.PI_USAGE_SYNC_TOKEN }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -31,13 +38,29 @@ jobs:
           cache: npm
 
       - name: Configure upstream remote
-        run: git remote add upstream https://github.com/Sreetej510/pi-extensions.git
+        run: |
+          echo 'FAILED_PHASE=configure-upstream' >> "$GITHUB_ENV"
+          git remote add upstream https://github.com/Sreetej510/pi-extensions.git
+          git fetch --force origin refs/tags/pi-usage-upstream-base:refs/tags/pi-usage-upstream-base
+          git fetch upstream master
+          echo "OLD_UPSTREAM_COMMIT=$(git rev-parse 'refs/tags/pi-usage-upstream-base^{commit}')" >> "$GITHUB_ENV"
+          echo "NEW_UPSTREAM_COMMIT=$(git rev-parse refs/remotes/upstream/master)" >> "$GITHUB_ENV"
 
       - name: Test synchronization fixture
-        run: bash .github/scripts/upstream-sync.sh --fixture-test
+        run: |
+          echo 'FAILED_PHASE=fixture-test' >> "$GITHUB_ENV"
+          bash .github/scripts/upstream-sync.sh --fixture-test
 
       - name: Synchronize upstream
-        run: bash .github/scripts/upstream-sync.sh
+        env:
+          FORCE_PUBLISH: ${{ inputs.force_publish }}
+        run: |
+          echo 'FAILED_PHASE=synchronize' >> "$GITHUB_ENV"
+          if [ "$FORCE_PUBLISH" = 'true' ]; then
+            bash .github/scripts/upstream-sync.sh --force
+          else
+            bash .github/scripts/upstream-sync.sh
+          fi
 
       - name: Report synchronization failure
         if: always() && failure()
@@ -54,6 +77,9 @@ jobs:
           The deterministic pi-usage upstream synchronization failed.
 
           - Run: $RUN_URL
+          - Failed phase: ${FAILED_PHASE:-unavailable}
+          - Old upstream commit: ${OLD_UPSTREAM_COMMIT:-unavailable}
+          - New upstream commit: ${NEW_UPSTREAM_COMMIT:-unavailable}
 
           Inspect the failed run and resolve the patch-stack or infrastructure error. Later success closes this issue automatically.
           EOF

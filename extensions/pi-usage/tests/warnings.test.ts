@@ -27,11 +27,13 @@ type WarningHarness = {
   statuses: Array<string | undefined>;
 };
 
-function snapshot(provider: "anthropic" | "codex", usedPercent: number): ProviderUsageSnapshotV1 {
+function snapshot(provider: "claude" | "codex", usedPercent: number): ProviderUsageSnapshotV1 {
   return {
     version: 1,
     provider,
+    source: "test-event",
     capturedAt: NOW + usedPercent,
+    complete: false,
     windows: [
       {
         id: `${provider}:five_hour`,
@@ -44,7 +46,7 @@ function snapshot(provider: "anthropic" | "codex", usedPercent: number): Provide
 }
 
 function warning(
-  provider: "anthropic" | "codex",
+  provider: "claude" | "codex",
   message: string,
   attachedSnapshot?: ProviderUsageSnapshotV1,
 ): ProviderUsageEventV1 {
@@ -135,9 +137,9 @@ void test("tracks independent soft-warning allowances for Anthropic and Codex", 
     const harness = createHarness();
     restoreProviderWarningState(harness.pi, harness.ctx);
 
-    handleProviderUsageEvent(harness.pi, harness.ctx, warning("anthropic", "Anthropic warning"));
+    handleProviderUsageEvent(harness.pi, harness.ctx, warning("claude", "Anthropic warning"));
     handleProviderUsageEvent(harness.pi, harness.ctx, warning("codex", "Codex warning"));
-    handleProviderUsageEvent(harness.pi, harness.ctx, warning("anthropic", "Anthropic repeat"));
+    handleProviderUsageEvent(harness.pi, harness.ctx, warning("claude", "Anthropic repeat"));
 
     assert.deepEqual(
       harness.notifications.map(({ message }) => message),
@@ -145,7 +147,7 @@ void test("tracks independent soft-warning allowances for Anthropic and Codex", 
     );
     assert.deepEqual(
       harness.markers.map(({ data }) => (data as { provider: string }).provider),
-      ["anthropic", "codex"],
+      ["claude", "codex"],
     );
   });
 });
@@ -203,13 +205,13 @@ void test("ignores warning markers without a recognized provider and finite nume
       {
         type: "custom",
         customType: PROVIDER_USAGE_WARNING_ENTRY_TYPE,
-        data: { provider: "anthropic", shownAt: NOW },
+        data: { provider: "claude", shownAt: NOW },
       },
     ]);
 
     restoreProviderWarningState(harness.pi, harness.ctx);
     handleProviderUsageEvent(harness.pi, harness.ctx, warning("codex", "Codex warning"));
-    handleProviderUsageEvent(harness.pi, harness.ctx, warning("anthropic", "Anthropic repeat"));
+    handleProviderUsageEvent(harness.pi, harness.ctx, warning("claude", "Anthropic repeat"));
 
     assert.deepEqual(harness.notifications, [{ message: "Codex warning", level: "warning" }]);
     assert.equal(harness.markers.length, 1);

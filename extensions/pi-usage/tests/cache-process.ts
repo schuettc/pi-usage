@@ -16,14 +16,14 @@ function startCacheChild(args: string[]): ChildProcess {
   });
 }
 
-export function startCacheWriter(cacheFile: string, now: number, provider: "codex" | "anthropic"): ChildProcess {
+export function startCacheWriter(cacheFile: string, now: number, provider: "codex" | "claude"): ChildProcess {
   return startCacheChild(["write", cacheFile, String(now), provider]);
 }
 
 export function startPausedCacheWriter(
   cacheFile: string,
   now: number,
-  provider: "codex" | "anthropic",
+  provider: "codex" | "claude",
   phase: MutationLockPhase,
   controlFile: string,
 ): ChildProcess {

@@ -57,7 +57,7 @@ export function normalizeAnthropicUsagePayload(
   }
 
   return {
-    provider: "anthropic",
+    provider: "claude",
     source: "anthropic-oauth",
     capturedAt,
     windows,
@@ -101,7 +101,7 @@ function normalizeModelScopedWindows(value: unknown): NormalizedUsageWindow[] {
     windows.push(...knownWindows);
 
     for (const [key, rawWindow] of Object.entries(bucket)) {
-      if (key in ROLLING_WINDOWS) continue;
+      if (key in ROLLING_WINDOWS || !rawWindow || typeof rawWindow !== "object" || Array.isArray(rawWindow)) continue;
       const window = normalizeRollingWindow(rawWindow, `${modelId}:${key}`, titleCaseCompactLabel(key), scope);
       if (window) windows.push(window);
     }
@@ -144,9 +144,14 @@ function normalizeEnterpriseWindows(payload: AnthropicOAuthUsagePayload): Enterp
       window: {
         id: key,
         label: titleCaseCompactLabel(key),
-        usedPercent: clampPercent(asNumber(value.utilization) ?? 0),
+        ...(asNumber(value.utilization) === undefined
+          ? {}
+          : { usedPercent: clampPercent(asNumber(value.utilization) as number) }),
         ...(resetsAt === undefined ? {} : { resetsAt }),
         scope: ACCOUNT_SCOPE,
+        usedAmount: usedDollars,
+        limitAmount: limitDollars,
+        currency: "USD",
       },
       usedDollars,
       limitDollars,
@@ -167,10 +172,16 @@ function normalizeExtraUsage(value: unknown): ExtraUsageWindow | undefined {
   return {
     window: {
       id: "extra_usage",
-      label: "Monthly extra usage",
-      usedPercent: clampPercent(asNumber(extraUsage.utilization) ?? 0),
+      label: "overage",
+      ...(asNumber(extraUsage.utilization) === undefined
+        ? {}
+        : { usedPercent: clampPercent(asNumber(extraUsage.utilization) as number) }),
       ...(resetsAt === undefined ? {} : { resetsAt }),
-      scope: ACCOUNT_SCOPE,
+      scope: { kind: "overage" },
+      state: "available",
+      usedAmount: usedCredits / 100,
+      ...(monthlyLimit === undefined ? {} : { limitAmount: monthlyLimit / 100 }),
+      currency: asString(extraUsage.currency) ?? "USD",
     },
     usedMajor: usedCredits / 100,
     monthlyLimitMajor: monthlyLimit === undefined ? undefined : monthlyLimit / 100,
@@ -192,8 +203,12 @@ function formatAnthropicSummary(
     lines.push("  Enterprise budget windows:");
     for (const { window, usedDollars, limitDollars } of enterpriseWindows) {
       const reset = window.resetsAt ? ` (resets ${formatReset(window.resetsAt)})` : "";
+      const utilization =
+        window.usedPercent === undefined
+          ? "usage unavailable"
+          : `${progressBarUsed(window.usedPercent)} ${window.usedPercent.toFixed(0)}% used`;
       lines.push(
-        `  ${window.label}: ${progressBarUsed(window.usedPercent)} ${window.usedPercent.toFixed(0)}% used (${formatCurrencyAmount(usedDollars, "USD")}/${formatCurrencyAmount(limitDollars, "USD")})${reset}`,
+        `  ${window.label}: ${utilization} (${formatCurrencyAmount(usedDollars, "USD")}/${formatCurrencyAmount(limitDollars, "USD")})${reset}`,
       );
     }
   }
@@ -205,7 +220,11 @@ function formatAnthropicSummary(
     const amount = `${formatCurrencyAmount(usedMajor, currency)}${monthlyLimitMajor !== undefined ? `/${formatCurrencyAmount(monthlyLimitMajor, currency)}` : ""}`;
     const reset = window.resetsAt ? ` (resets ${formatReset(window.resetsAt)})` : "";
     lines.push("  Monthly extra usage:");
-    lines.push(`  ${progressBarUsed(window.usedPercent)} ${window.usedPercent.toFixed(0)}% used ${amount}${reset}`);
+    const utilization =
+      window.usedPercent === undefined
+        ? "usage unavailable"
+        : `${progressBarUsed(window.usedPercent)} ${window.usedPercent.toFixed(0)}% used`;
+    lines.push(`  ${utilization} ${amount}${reset}`);
   }
 
   if (accountRollingWindows.length > 0) {
@@ -235,8 +254,10 @@ function formatLegacyAnthropicStatusline(
   const statusParts = ["claude"];
 
   if (enterpriseWindows.length > 0) {
-    const primary = [...enterpriseWindows].sort((left, right) => right.window.usedPercent - left.window.usedPercent)[0];
-    statusParts.push(`${primary.window.usedPercent.toFixed(0)}%`);
+    const primary = [...enterpriseWindows].sort(
+      (left, right) => (right.window.usedPercent ?? -1) - (left.window.usedPercent ?? -1),
+    )[0];
+    if (primary.window.usedPercent !== undefined) statusParts.push(`${primary.window.usedPercent.toFixed(0)}%`);
     statusParts.push(
       `${formatCurrencyAmount(primary.usedDollars, "USD", 0)}/${formatCurrencyAmount(primary.limitDollars, "USD", 0)}`,
     );
@@ -246,13 +267,16 @@ function formatLegacyAnthropicStatusline(
     const hadStatusSegment = statusParts.length > 1;
     const { window, usedMajor, monthlyLimitMajor, currency } = extraUsage;
     const amount = `${formatCurrencyAmount(usedMajor, currency, 0)}${monthlyLimitMajor !== undefined ? `/${formatCurrencyAmount(monthlyLimitMajor, currency, 0)}` : ""}`;
-    statusParts.push(`${window.usedPercent.toFixed(0)}%`, amount);
+    if (window.usedPercent !== undefined) statusParts.push(`${window.usedPercent.toFixed(0)}%`);
+    statusParts.push(amount);
     if (hadStatusSegment) statusParts.push("extra");
   }
 
   if (statusParts.length === 1) {
     const rollingWindows = accountRollingWindows.length > 0 ? accountRollingWindows : modelRollingWindows;
-    for (const window of rollingWindows) statusParts.push(`${window.usedPercent.toFixed(0)}% ${window.label}`);
+    for (const window of rollingWindows) {
+      if (window.usedPercent !== undefined) statusParts.push(`${window.usedPercent.toFixed(0)}% ${window.label}`);
+    }
   }
 
   return statusParts.join(" ");
@@ -274,7 +298,11 @@ function groupModelWindows(
 
 function formatRollingWindow(window: NormalizedUsageWindow): string {
   const reset = window.resetsAt ? ` (resets ${formatReset(window.resetsAt, window.label !== "5h")})` : "";
-  return `${window.label}: ${progressBarUsed(window.usedPercent)} ${window.usedPercent.toFixed(0)}% used${reset}`;
+  const utilization =
+    window.usedPercent === undefined
+      ? "usage unavailable"
+      : `${progressBarUsed(window.usedPercent)} ${window.usedPercent.toFixed(0)}% used`;
+  return `${window.label}: ${utilization}${reset}`;
 }
 
 function isoToEpochSeconds(value: string | undefined): number | undefined {

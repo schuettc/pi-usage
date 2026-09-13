@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getUsageBusV1 } from "./adapter-bus.js";
+import { getUsageAdaptersV1 } from "./adapter-bus.js";
 import {
   ANTHROPIC_PROVIDER_ID,
   CACHE_TTL_MS,
@@ -15,9 +15,11 @@ import { isUsageSupportedModel, providerKeyForModel, reportMatchesModel } from "
 import { normalizeExternalUsageSnapshot } from "./normalize-external.js";
 import { queryUsageWithRetries } from "./query.js";
 import {
+  isSharedCacheMutationAvailable,
   readFreshReportForModel,
   readSharedUsageCache,
   releaseRefreshLease,
+  renewRefreshLease,
   saveSharedBackoff,
   saveSharedUsageReport,
   sharedBackoffRemainingMs,
@@ -53,6 +55,7 @@ let cache: CachedReport | undefined;
 let combinedCache: { createdAt: number; reports: UsageReport[] } | undefined;
 let statuslineClearTimer: StatuslineTimer | undefined;
 let statuslineRefreshTimer: StatuslineTimer | undefined;
+let statuslineCountdownTimer: StatuslineTimer | undefined;
 let statuslineRequestId = 0;
 let sessionActive = false;
 let activeStatuslineContext: ExtensionContext | undefined;
@@ -82,8 +85,10 @@ export function clearCodexMemoryCache(): void {
 const clearStatuslineTimers = () => {
   if (statuslineClearTimer) runtime.clearTimeout(statuslineClearTimer);
   if (statuslineRefreshTimer) runtime.clearTimeout(statuslineRefreshTimer);
+  if (statuslineCountdownTimer) runtime.clearTimeout(statuslineCountdownTimer);
   statuslineClearTimer = undefined;
   statuslineRefreshTimer = undefined;
+  statuslineCountdownTimer = undefined;
 };
 
 /** Replaces clock, query, and timer behavior while resetting module state.
@@ -162,6 +167,28 @@ const scheduleStatuslineRefresh = (
   statuslineRefreshTimer.unref?.();
 };
 
+const scheduleCountdownRerender = (
+  ctx: ExtensionContext,
+  report: UsageReport,
+  model: ProviderUsageModel | undefined,
+  stale: boolean,
+) => {
+  if (statuslineCountdownTimer) runtime.clearTimeout(statuslineCountdownTimer);
+  const requestId = statuslineRequestId;
+  const rerender = () => {
+    statuslineCountdownTimer = undefined;
+    if (!sessionActive || requestId !== statuslineRequestId) return;
+    let text = formatUsageStatusline(report, model);
+    if (text === undefined) return;
+    if (stale) text = `${text} (${formatAgeShort(Math.max(0, runtime.now() - report.capturedAt))} old)`;
+    if (!setStatuslineValue(ctx, text)) return;
+    statuslineCountdownTimer = runtime.setTimeout(rerender, 60_000);
+    statuslineCountdownTimer.unref?.();
+  };
+  statuslineCountdownTimer = runtime.setTimeout(rerender, 60_000);
+  statuslineCountdownTimer.unref?.();
+};
+
 const setUsageStatusline = (
   ctx: ExtensionContext,
   report: UsageReport,
@@ -169,6 +196,7 @@ const setUsageStatusline = (
     autoRefresh: boolean;
     model: ProviderUsageModel | undefined;
     staleAgeMs?: number;
+    forceStale?: boolean;
     refreshDelayMs?: number;
     schedule?: boolean;
   },
@@ -178,13 +206,13 @@ const setUsageStatusline = (
     setStatuslineValue(ctx, undefined);
     return false;
   }
-  if (options.staleAgeMs !== undefined && options.staleAgeMs >= CACHE_TTL_MS) {
-    text = `${text} (${formatAgeShort(options.staleAgeMs)} old)`;
-  }
+  const stale = options.forceStale === true || (options.staleAgeMs !== undefined && options.staleAgeMs >= CACHE_TTL_MS);
+  if (stale) text = `${text} (${formatAgeShort(options.staleAgeMs as number)} old)`;
   if (!setStatuslineValue(ctx, text)) return false;
   activeStatuslineContext = ctx;
   if (statuslineClearTimer) runtime.clearTimeout(statuslineClearTimer);
   statuslineClearTimer = undefined;
+  scheduleCountdownRerender(ctx, report, options.model, stale);
   if (options.schedule === false) return true;
   if (options.autoRefresh) scheduleStatuslineRefresh(ctx, options.model, options.refreshDelayMs);
   else scheduleTemporaryStatuslineClear(ctx);
@@ -228,9 +256,8 @@ function usageProviderForModel(model: ProviderUsageModel): UsageProviderKey {
     return providerKeyForModel(model);
   }
   return (
-    getUsageBusV1()
-      .adapters()
-      .find((adapter) => adapter.modelProviders.includes(model.provider))?.usageProvider ?? providerKeyForModel(model)
+    getUsageAdaptersV1().find((adapter) => adapter.modelProviders.includes(model.provider))?.usageProvider ??
+    providerKeyForModel(model)
   );
 }
 
@@ -293,12 +320,15 @@ export async function refreshCurrentUsageStatusline(ctx: ExtensionContext, model
   // in-memory fence outlives the persisted lease so a long poll cannot
   // reacquire with this process-wide owner and later release its newer lease.
   const activeInThisProcess = activeRefreshProviders.has(providerKey);
-  if (activeInThisProcess || !tryAcquireRefreshLease(providerKey, refreshLeaseOwner, now)) {
+  const coordinated = isSharedCacheMutationAvailable();
+  const leaseAcquired =
+    coordinated && !activeInThisProcess ? tryAcquireRefreshLease(providerKey, refreshLeaseOwner, now) : false;
+  if (activeInThisProcess || (coordinated && !leaseAcquired)) {
     const leaseExpiry = readSharedUsageCache()?.refreshLeases?.[providerKey]?.expiresAt;
     const retryDelayMs =
       activeInThisProcess && (leaseExpiry === undefined || leaseExpiry <= now)
         ? REFRESH_LEASE_MS
-        : Math.max(1, (leaseExpiry ?? now + REFRESH_LEASE_MS) - now);
+        : Math.max(10_000, (leaseExpiry ?? now + REFRESH_LEASE_MS) - now);
     if (cached) {
       setUsageStatusline(ctx, cached.report, {
         autoRefresh: true,
@@ -313,6 +343,16 @@ export async function refreshCurrentUsageStatusline(ctx: ExtensionContext, model
   }
 
   activeRefreshProviders.add(providerKey);
+  let leaseRenewalTimer: StatuslineTimer | undefined;
+  const scheduleLeaseRenewal = () => {
+    if (!leaseAcquired) return;
+    leaseRenewalTimer = runtime.setTimeout(() => {
+      renewRefreshLease(providerKey, refreshLeaseOwner, runtime.now());
+      scheduleLeaseRenewal();
+    }, 10_000);
+    leaseRenewalTimer.unref?.();
+  };
+  scheduleLeaseRenewal();
   let result: QueryUsageResult;
   let rateLimited = false;
   let retryDelayMs = CACHE_TTL_MS;
@@ -344,7 +384,8 @@ export async function refreshCurrentUsageStatusline(ctx: ExtensionContext, model
       if (rateLimited) saveSharedBackoff(providerKey, completedAt + retryDelayMs, completedAt);
     }
   } finally {
-    releaseRefreshLease(providerKey, refreshLeaseOwner);
+    if (leaseRenewalTimer) runtime.clearTimeout(leaseRenewalTimer);
+    if (leaseAcquired) releaseRefreshLease(providerKey, refreshLeaseOwner);
     activeRefreshProviders.delete(providerKey);
   }
 
@@ -372,37 +413,58 @@ export async function refreshCurrentUsageStatusline(ctx: ExtensionContext, model
   setUsageStatusline(ctx, result.report, { autoRefresh: true, model: selectedModel });
 }
 
-export function applyCurrentProviderStatusline(ctx: ExtensionContext, reports: UsageReport[]): boolean {
+export function applyCurrentProviderStatusline(
+  ctx: ExtensionContext,
+  reports: UsageReport[],
+  cached?: { createdAt: number; stale: boolean },
+): boolean {
   const current = reports.find((report) => reportMatchesModel(report, ctx.model));
   if (!current) {
     setStatuslineValue(ctx, undefined);
     return false;
   }
-  cache = { createdAt: runtime.now(), report: current };
+  cache = { createdAt: cached?.createdAt ?? runtime.now(), report: current };
   activeModelProvider = ctx.model?.provider;
   setUsageStatusline(ctx, current, {
     autoRefresh: isUsageSupportedModel(ctx.model),
     model: ctx.model,
+    ...(cached ? { staleAgeMs: Math.max(0, runtime.now() - cached.createdAt), forceStale: cached.stale } : {}),
   });
   return true;
 }
 
 /** Normalizes an adapter bus snapshot, persists it, and immediately applies it
- * when it matches the selected model. Task 6 owns bus subscription lifecycle. */
+ * when it matches the selected model. */
 export function applyProviderUsageSnapshot(ctx: ExtensionContext, snapshot: ProviderUsageSnapshotV1): boolean {
   try {
-    const selectedAdapter = getUsageBusV1()
-      .adapters()
-      .find(
+    const adapters = getUsageAdaptersV1();
+    const selectedAdapter =
+      (snapshot.adapterId ? adapters.find((adapter) => adapter.id === snapshot.adapterId) : undefined) ??
+      adapters.find(
         (adapter) =>
           adapter.usageProvider === snapshot.provider &&
           ctx.model !== undefined &&
           adapter.modelProviders.includes(ctx.model.provider),
       );
-    const nativeProvider = snapshot.provider === "anthropic" ? ANTHROPIC_PROVIDER_ID : CODEX_PROVIDER_ID;
-    const modelProviders = [...new Set([...(selectedAdapter?.modelProviders ?? []), nativeProvider])];
-    const report = normalizeExternalUsageSnapshot(snapshot, modelProviders);
+    if (selectedAdapter && selectedAdapter.usageProvider !== snapshot.provider) return false;
+    const previous = findPreviousAdapterReport(snapshot.provider, snapshot.adapterId ?? selectedAdapter?.id);
+    const nativeProvider = snapshot.provider === "claude" ? ANTHROPIC_PROVIDER_ID : CODEX_PROVIDER_ID;
+    const modelProviders = [
+      ...new Set([...(previous?.modelProviders ?? []), ...(selectedAdapter?.modelProviders ?? []), nativeProvider]),
+    ];
+    const normalized = normalizeExternalUsageSnapshot(
+      snapshot.adapterId === undefined && selectedAdapter ? { ...snapshot, adapterId: selectedAdapter.id } : snapshot,
+      modelProviders,
+    );
+    const report = !normalized.complete && previous ? mergePartialAdapterReport(previous, normalized) : normalized;
     const now = runtime.now();
+    const retainedReports = (combinedCache?.reports ?? []).filter(
+      (candidate) =>
+        candidate.source !== "external-adapter" ||
+        candidate.provider !== report.provider ||
+        candidate.adapterId !== report.adapterId,
+    );
+    combinedCache = { createdAt: now, reports: [...retainedReports, report] };
     saveSharedUsageReport(report, now);
     if (!reportMatchesModel(report, ctx.model)) return false;
 
@@ -414,6 +476,47 @@ export function applyProviderUsageSnapshot(ctx: ExtensionContext, snapshot: Prov
   } catch {
     return false;
   }
+}
+
+function findPreviousAdapterReport(
+  provider: UsageProviderKey,
+  adapterId: string | undefined,
+): Extract<UsageReport, { source: "external-adapter" }> | undefined {
+  const reports = [cache?.report, ...(combinedCache?.reports ?? []), readSharedUsageCache()?.entries[provider]?.report];
+  return reports.find(
+    (report): report is Extract<UsageReport, { source: "external-adapter" }> =>
+      report?.source === "external-adapter" &&
+      report.provider === provider &&
+      (adapterId === undefined || report.adapterId === adapterId),
+  );
+}
+
+function mergePartialAdapterReport(
+  previous: Extract<UsageReport, { source: "external-adapter" }>,
+  partial: Extract<UsageReport, { source: "external-adapter" }>,
+): Extract<UsageReport, { source: "external-adapter" }> {
+  const merged = new Map(previous.windows.map((window) => [usageWindowIdentity(window), window]));
+  for (const window of partial.windows) {
+    const identity = usageWindowIdentity(window);
+    merged.set(identity, { ...(merged.get(identity) ?? {}), ...window });
+  }
+  return {
+    ...partial,
+    providerLabel: partial.providerLabel ?? previous.providerLabel,
+    adapterId: partial.adapterId ?? previous.adapterId,
+    modelProviders: [...new Set([...previous.modelProviders, ...partial.modelProviders])],
+    windows: [...merged.values()],
+  };
+}
+
+function usageWindowIdentity(window: ProviderUsageSnapshotV1["windows"][number]): string {
+  const scope =
+    window.scope.kind === "model"
+      ? `model:${[...window.scope.modelIds].sort().join(",")}`
+      : window.scope.kind === "provider"
+        ? `provider:${window.scope.id}`
+        : window.scope.kind;
+  return `${scope}:${window.id}`;
 }
 
 export const applyProviderUsageSnapshotToStatusline = applyProviderUsageSnapshot;

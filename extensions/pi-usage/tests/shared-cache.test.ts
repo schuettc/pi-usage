@@ -42,7 +42,7 @@ function report(capturedAt = NOW, usedPercent = 23): CodexUsageReport {
 
 function anthropicReport(capturedAt = NOW): AnthropicUsageReport {
   return {
-    provider: "anthropic",
+    provider: "claude",
     source: "anthropic-oauth",
     capturedAt,
     windows: [],
@@ -155,10 +155,10 @@ void test("an expired refresh lease can be replaced with a clamped lease", () =>
 
 void test("an unexpired lease suppresses every competing acquisition", () => {
   withCache(() => {
-    assert.equal(tryAcquireRefreshLease("anthropic", "first", NOW), true);
-    assert.equal(tryAcquireRefreshLease("anthropic", "foreign", NOW + 1), false);
-    assert.equal(tryAcquireRefreshLease("anthropic", "first", NOW + 1), false);
-    assert.deepEqual(readSharedUsageCache()?.refreshLeases?.anthropic, {
+    assert.equal(tryAcquireRefreshLease("claude", "first", NOW), true);
+    assert.equal(tryAcquireRefreshLease("claude", "foreign", NOW + 1), false);
+    assert.equal(tryAcquireRefreshLease("claude", "first", NOW + 1), false);
+    assert.deepEqual(readSharedUsageCache()?.refreshLeases?.claude, {
       owner: "first",
       expiresAt: NOW + REFRESH_LEASE_MS,
     });
@@ -199,7 +199,7 @@ void test("malformed legacy metadata and PID reuse cannot block the stable mutat
     saveSharedUsageReport(anthropicReport(), NOW);
 
     assert.equal(statSync(lockFile).ino, originalInode);
-    assert.equal(readSharedUsageCache()?.entries.anthropic?.report.provider, "anthropic");
+    assert.equal(readSharedUsageCache()?.entries.claude?.report.provider, "claude");
   });
 });
 
@@ -225,7 +225,7 @@ void test("a pre-replacement holder fences a bounded contender and preserves bot
       saveSharedUsageReport(anthropicReport(), NOW);
       const shared = readSharedUsageCache();
       assert.equal(shared?.entries.codex?.report.provider, "codex");
-      assert.equal(shared?.entries.anthropic?.report.provider, "anthropic");
+      assert.equal(shared?.entries.claude?.report.provider, "claude");
     } finally {
       await stopChild(codexChild);
     }
@@ -241,7 +241,7 @@ void test("process death during acquisition automatically releases mutation owne
       await stopChild(child);
 
       saveSharedUsageReport(anthropicReport(), NOW);
-      assert.equal(readSharedUsageCache()?.entries.anthropic?.report.provider, "anthropic");
+      assert.equal(readSharedUsageCache()?.entries.claude?.report.provider, "claude");
     } finally {
       await stopChild(child);
     }
@@ -253,21 +253,21 @@ void test("process death immediately before and after replacement cannot strand 
     await withCacheAsync(async (cacheFile) => {
       saveSharedUsageReport(report(), NOW);
       const controlFile = `${cacheFile}.control`;
-      const child = startPausedCacheWriter(cacheFile, NOW, "anthropic", phase, controlFile);
+      const child = startPausedCacheWriter(cacheFile, NOW, "claude", phase, controlFile);
       try {
         await waitForMutationPhase(child, controlFile, phase);
 
         saveSharedUsageReport(report(NOW + 1, 91), NOW + 1);
         const whileHeld = readSharedUsageCache();
         assert.equal(whileHeld?.entries.codex?.report.snapshots[0]?.primary?.usedPercent, 23);
-        assert.equal(whileHeld?.entries.anthropic !== undefined, phase === "after-cache-replace");
+        assert.equal(whileHeld?.entries.claude !== undefined, phase === "after-cache-replace");
 
         await stopChild(child);
         saveSharedUsageReport(report(NOW + 1, 91), NOW + 1);
 
         const recovered = readSharedUsageCache();
         assert.equal(recovered?.entries.codex?.report.snapshots[0]?.primary?.usedPercent, 91);
-        assert.equal(recovered?.entries.anthropic !== undefined, phase === "after-cache-replace");
+        assert.equal(recovered?.entries.claude !== undefined, phase === "after-cache-replace");
         assert.doesNotThrow(() => JSON.parse(readFileSync(cacheFile, "utf8")));
       } finally {
         await stopChild(child);
@@ -279,7 +279,7 @@ void test("process death immediately before and after replacement cannot strand 
 void test("concurrent child writers preserve both provider updates", async () => {
   await withCacheAsync(async (cacheFile) => {
     const codexChild = startCacheWriter(cacheFile, NOW, "codex");
-    const anthropicChild = startCacheWriter(cacheFile, NOW, "anthropic");
+    const anthropicChild = startCacheWriter(cacheFile, NOW, "claude");
     try {
       await Promise.all([waitForChildMessage(codexChild, "ready"), waitForChildMessage(anthropicChild, "ready")]);
       const codexDone = waitForChildMessage(codexChild, "done");
@@ -291,7 +291,7 @@ void test("concurrent child writers preserve both provider updates", async () =>
 
       const shared = readSharedUsageCache();
       assert.equal(shared?.entries.codex?.report.provider, "codex");
-      assert.equal(shared?.entries.anthropic?.report.provider, "anthropic");
+      assert.equal(shared?.entries.claude?.report.provider, "claude");
     } finally {
       await Promise.all([stopChild(codexChild), stopChild(anthropicChild)]);
     }

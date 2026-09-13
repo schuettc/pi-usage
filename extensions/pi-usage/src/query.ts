@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getUsageBusV1 } from "./adapter-bus.js";
+import { getUsageAdaptersV1 } from "./adapter-bus.js";
 import { queryAnthropicUsage } from "./anthropic-query.js";
 import { queryViaCodexAppServer } from "./codex-app-server.js";
 import { queryCodexUsageWithFallback, queryViaPiAuth } from "./codex-query.js";
@@ -24,14 +24,31 @@ export async function queryAllUsage(
 
   type ProviderResult = { report?: UsageReport; errors: UsageQueryError[] };
   const empty: ProviderResult = { errors: [] };
-
-  const [codexSettled, anthropicSettled] = await Promise.allSettled([
-    hasCodex ? queryCodexUsageWithFallback(ctx, options.timeoutMs) : Promise.resolve<ProviderResult>(empty),
-    hasAnthropic
-      ? queryAnthropicUsage(ctx, options.timeoutMs).then((report): ProviderResult => ({ report, errors: [] }))
-      : Promise.resolve<ProviderResult>(empty),
-  ]);
-
+  const adapters = [...new Map(getUsageAdaptersV1().map((adapter) => [adapter.id, adapter])).values()];
+  const queries: Array<{ source: UsageSource; promise: Promise<ProviderResult> }> = [
+    {
+      source: "pi-auth",
+      promise: hasCodex ? queryCodexUsageWithFallback(ctx, options.timeoutMs) : Promise.resolve<ProviderResult>(empty),
+    },
+    {
+      source: "anthropic-oauth",
+      promise: hasAnthropic
+        ? queryAnthropicUsage(ctx, options.timeoutMs).then((report): ProviderResult => ({ report, errors: [] }))
+        : Promise.resolve<ProviderResult>(empty),
+    },
+    ...adapters.map((adapter) => ({
+      source: "external-adapter" as const,
+      promise: Promise.resolve()
+        .then(() => adapter.refresh({ timeoutMs: options.timeoutMs }))
+        .then(
+          (snapshot): ProviderResult => ({
+            report: normalizeAdapterSnapshot(snapshot, adapter.id, adapter.usageProvider, adapter.modelProviders),
+            errors: [],
+          }),
+        ),
+    })),
+  ];
+  const settledResults = await Promise.allSettled(queries.map(({ promise }) => promise));
   const reports: UsageReport[] = [];
   const errors: UsageQueryError[] = [];
 
@@ -47,8 +64,9 @@ export async function queryAllUsage(
       errors.push(...settled.value.errors);
     }
   };
-  collect(codexSettled, "pi-auth");
-  collect(anthropicSettled, "anthropic-oauth");
+  settledResults.forEach((settled, index) => {
+    collect(settled, queries[index]?.source ?? "external-adapter");
+  });
 
   return { reports, errors };
 }
@@ -99,9 +117,7 @@ export async function queryUsage(
     const adapter =
       modelProvider === undefined
         ? undefined
-        : getUsageBusV1()
-            .adapters()
-            .find((candidate) => candidate.modelProviders.includes(modelProvider));
+        : getUsageAdaptersV1().find((candidate) => candidate.modelProviders.includes(modelProvider));
     if (!adapter) {
       return {
         ok: false,
@@ -111,7 +127,10 @@ export async function queryUsage(
 
     try {
       const snapshot = await adapter.refresh({ timeoutMs: options.timeoutMs });
-      return { ok: true, report: normalizeExternalUsageSnapshot(snapshot, adapter.modelProviders) };
+      return {
+        ok: true,
+        report: normalizeAdapterSnapshot(snapshot, adapter.id, adapter.usageProvider, adapter.modelProviders),
+      };
     } catch (cause) {
       return {
         ok: false,
@@ -139,4 +158,22 @@ export async function queryUsage(
   }
 
   return { ok: false, errors };
+}
+
+function normalizeAdapterSnapshot(
+  snapshot: Parameters<typeof normalizeExternalUsageSnapshot>[0],
+  adapterId: string,
+  usageProvider: "claude" | "codex",
+  modelProviders: string[],
+): UsageReport {
+  if (snapshot.provider !== usageProvider) {
+    throw new Error(`External adapter ${adapterId} returned the wrong provider.`);
+  }
+  if (snapshot.adapterId !== undefined && snapshot.adapterId !== adapterId) {
+    throw new Error(`External adapter ${adapterId} returned a mismatched adapterId.`);
+  }
+  return normalizeExternalUsageSnapshot(
+    snapshot.adapterId === undefined ? { ...snapshot, adapterId } : snapshot,
+    modelProviders,
+  );
 }

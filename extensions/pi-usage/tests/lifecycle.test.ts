@@ -177,6 +177,26 @@ void test("contains a stale subscribed context and removes its listener", async 
   });
 });
 
+void test("incompatible and throwing registries cannot break lifecycle startup", async () => {
+  await withCleanBus(async () => {
+    const pi = fakePi();
+    usageExtension(pi.api);
+    globalRegistry[BUS_SYMBOL] = { version: 2 };
+    await assert.doesNotReject(pi.emit({ type: "session_start", reason: "startup" }, context()));
+
+    globalRegistry[BUS_SYMBOL] = {
+      version: 1,
+      register: () => () => {},
+      adapters: () => [],
+      subscribe: () => {
+        throw new Error("subscribe failed");
+      },
+      publish: () => 0,
+    };
+    await assert.doesNotReject(pi.emit({ type: "session_start", reason: "new" }, context()));
+  });
+});
+
 void test("runs standalone by creating a bus when no bridge adapter is present", async () => {
   await withCleanBus(async () => {
     const notifications: string[] = [];

@@ -56,3 +56,22 @@ void test("normalizes account and model-scoped Anthropic rolling windows", () =>
     false,
   );
 });
+
+void test("ignores scalar and array metadata inside model-scoped buckets", () => {
+  assert.doesNotThrow(() =>
+    normalizeAnthropicUsagePayload(
+      {
+        five_hour: { utilization: 20 },
+        model_scoped: {
+          fable: {
+            display_name: "Fable",
+            metadata: ["not", "a", "window"],
+            request_count: 4,
+            seven_day: { utilization: 42 },
+          },
+        },
+      },
+      Date.parse("2026-09-12T13:00:00Z"),
+    ),
+  );
+});

@@ -30,7 +30,7 @@
  *   command.ts            /usage command handler
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getUsageBusV1 } from "./adapter-bus.js";
+import { getOptionalUsageBusV1, isProviderUsageEventV1 } from "./adapter-bus.js";
 import { registerUsageCommand } from "./command.js";
 import { installUsageFooter, isFooterRegistered, setFooterRegistered } from "./footer.js";
 import { isUsageSupportedModel } from "./models.js";
@@ -43,6 +43,7 @@ import {
 } from "./statusline.js";
 import { handleProviderUsageEvent, resetProviderWarningState, restoreProviderWarningState } from "./warnings.js";
 
+export { getUsageBusV1, PROVIDER_USAGE_BUS_SYMBOL } from "./adapter-bus.js";
 export { completeCodexStatusArguments, parseArgs } from "./args.js";
 export { isStaleExtensionContextError } from "./errors.js";
 export { formatCodexUsageReport, formatCodexUsageStatusline } from "./format.js";
@@ -53,7 +54,15 @@ export type {
   NormalizedCredits,
   NormalizedRateLimitSnapshot,
   NormalizedRateLimitWindow,
+  NormalizedUsageWindow,
+  ProviderKeyV1,
+  ProviderUsageAdapterV1,
+  ProviderUsageBusV1,
+  ProviderUsageEventV1,
   ProviderUsageModel,
+  ProviderUsageSnapshotV1,
+  UsageScopeV1,
+  UsageStateV1,
 } from "./types.js";
 
 export default function usageExtension(pi: ExtensionAPI) {
@@ -65,7 +74,11 @@ export default function usageExtension(pi: ExtensionAPI) {
   const stopProviderUsageSubscription = () => {
     const subscription = activeProviderUsageSubscription;
     activeProviderUsageSubscription = undefined;
-    subscription?.unsubscribe?.();
+    try {
+      subscription?.unsubscribe?.();
+    } catch {
+      // Optional registry cleanup is best-effort.
+    }
   };
 
   const startProviderUsageSubscription = (ctx: ExtensionContext, restoreMarkers: boolean) => {
@@ -73,25 +86,29 @@ export default function usageExtension(pi: ExtensionAPI) {
     try {
       if (restoreMarkers) restoreProviderWarningState(pi, ctx);
       else resetProviderWarningState(pi);
+      const bus = getOptionalUsageBusV1();
+      if (!bus) return;
       const subscription: ProviderUsageSubscription = {};
       activeProviderUsageSubscription = subscription;
-      const unsubscribe = getUsageBusV1().subscribe((event) => {
-        if (activeProviderUsageSubscription !== subscription) return;
+      const unsubscribe = bus.subscribe((event) => {
+        if (activeProviderUsageSubscription !== subscription || !isProviderUsageEventV1(event)) return;
         try {
           // Access a guarded context property before snapshot application,
           // whose fail-closed normalization intentionally returns false.
           void ctx.sessionManager;
           handleProviderUsageEvent(pi, ctx, event);
         } catch (error) {
-          if (!handleStaleContextError(ctx, error)) throw error;
-          if (activeProviderUsageSubscription === subscription) stopProviderUsageSubscription();
+          if (handleStaleContextError(ctx, error) && activeProviderUsageSubscription === subscription) {
+            stopProviderUsageSubscription();
+          }
         }
       });
       subscription.unsubscribe = unsubscribe;
       // A structural bus may invoke a listener synchronously from subscribe.
       if (activeProviderUsageSubscription !== subscription) unsubscribe();
     } catch (error) {
-      if (!handleStaleContextError(ctx, error)) throw error;
+      // Optional bus failures must not escape into pi lifecycle handling.
+      handleStaleContextError(ctx, error);
     }
   };
 

@@ -41,6 +41,8 @@ const financialAnthropicReport = normalizeAnthropicUsagePayload(
 const codexAdapterReport: AdapterUsageReport = {
   provider: "codex",
   source: "external-adapter",
+  snapshotSource: "test-adapter",
+  complete: true,
   modelProviders: ["openai-codex"],
   capturedAt: now,
   windows: [
@@ -73,7 +75,7 @@ void test("renders matching Anthropic model windows before account windows", () 
   try {
     assert.equal(
       formatUsageStatusline(anthropicReport, model("anthropic", "fable", "Claude Fable")),
-      "Fable · 5h 75% ↻2h · 7d 41%",
+      "Claude · Fable 5h 75% ↻2h · Fable 7d 41% ↻5d",
     );
   } finally {
     Date.now = originalNow;
@@ -91,7 +93,7 @@ void test("preserves native Anthropic financial status while rendering matched m
     );
     assert.equal(
       formatUsageStatusline(financialAnthropicReport, model("anthropic", "fable", "Claude Fable")),
-      "Fable · 5h 75% ↻2h · 7d 41%",
+      "Claude · Cinder Cove 60% · Fable 5h 75% ↻2h · Fable 7d 41% ↻5d · overage 50%",
     );
   } finally {
     Date.now = originalNow;
@@ -104,7 +106,7 @@ void test("renders matching external Codex model windows", () => {
   try {
     assert.equal(
       formatUsageStatusline(codexAdapterReport, model("openai-codex", "gpt-5.1-codex", "GPT 5.1 Codex")),
-      "GPT · 5h 32% ↻47m · 7d 18%",
+      "Codex · 5h 32% ↻47m · 7d 18% ↻5d",
     );
   } finally {
     Date.now = originalNow;
@@ -117,7 +119,7 @@ void test("falls back to Anthropic account windows for an unmatched Claude model
   try {
     assert.equal(
       formatUsageStatusline(anthropicReport, model("anthropic", "claude-sonnet", "Claude Sonnet")),
-      "Claude · 5h 23% ↻3h · 7d 12%",
+      "Claude · 5h 23% ↻3h · 7d 12% ↻5d",
     );
   } finally {
     Date.now = originalNow;

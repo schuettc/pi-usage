@@ -61,7 +61,7 @@ function codexReport(capturedAt = NOW, usedPercent = 23): CodexUsageReport {
 
 function anthropicReport(capturedAt = NOW): AnthropicUsageReport {
   return {
-    provider: "anthropic",
+    provider: "claude",
     source: "anthropic-oauth",
     capturedAt,
     windows: [],
@@ -136,7 +136,7 @@ void test("fresh disk cache renders synchronously without starting a provider qu
     const refresh = refreshCurrentUsageStatusline(ctx, codexModel);
 
     assert.equal(queryCalls, 0);
-    assert.equal(statuses.at(-1), "codex 23% 5h");
+    assert.equal(statuses.at(-1), "Codex · 5h 23%");
     assert.equal(timers.at(-1)?.delayMs, CACHE_TTL_MS - 1_000);
     await refresh;
   });
@@ -199,13 +199,71 @@ void test("stale cache stays visible with an age marker while refresh is pending
     const refresh = refreshCurrentUsageStatusline(ctx, codexModel);
 
     assert.equal(queryCalls, 1);
-    assert.equal(statuses.at(-1), "codex 23% 5h (4m old)");
+    assert.equal(statuses.at(-1), "Codex · 5h 23% (4m old)");
     assert.match(readSharedUsageCache()?.refreshLeases?.codex?.owner ?? "", /^\d+:[0-9a-f-]+$/i);
 
     resolveQuery({ ok: true, report: codexReport(NOW, 31) });
     await refresh;
-    assert.equal(statuses.at(-1), "codex 31% 5h");
+    assert.equal(statuses.at(-1), "Codex · 5h 31%");
     assert.equal(readSharedUsageCache()?.refreshLeases?.codex, undefined);
+  });
+});
+
+void test("the minute timer rerenders countdowns without querying", async () => {
+  await withHarness(async ({ timers, setNow, setQuery }) => {
+    let queryCalls = 0;
+    setQuery(async () => {
+      queryCalls++;
+      return { ok: true, report: codexReport() };
+    });
+    const report = codexReport(NOW - 1_000);
+    const primary = report.snapshots[0]?.primary;
+    if (primary) primary.resetsAt = (NOW + 2 * 60_000) / 1000;
+    saveSharedUsageReport(report, NOW - 1_000);
+    const statuses: Array<string | undefined> = [];
+    await refreshCurrentUsageStatusline(context(codexModel, statuses), codexModel);
+    const minuteTimer = timers.find((timer) => timer.delayMs === 60_000 && !timer.cleared);
+    assert.ok(minuteTimer);
+
+    const originalNow = Date.now;
+    Date.now = () => NOW + 60_000;
+    setNow(NOW + 60_000);
+    try {
+      minuteTimer.callback();
+    } finally {
+      Date.now = originalNow;
+    }
+    assert.equal(queryCalls, 0);
+    assert.match(statuses.at(-1) ?? "", /↻1m/);
+  });
+});
+
+void test("an owned lease renews during a poll longer than thirty seconds", async () => {
+  await withHarness(async ({ timers, setNow, setQuery }) => {
+    let resolveQuery!: (result: QueryUsageResult) => void;
+    let queryCalls = 0;
+    setQuery(
+      () =>
+        new Promise((resolve) => {
+          queryCalls++;
+          resolveQuery = resolve;
+        }),
+    );
+    const refresh = refreshCurrentUsageStatusline(context(codexModel, []), codexModel);
+    assert.equal(queryCalls, 1);
+
+    for (let seconds = 10; seconds <= 30; seconds += 10) {
+      setNow(NOW + seconds * 1_000);
+      const renewal = [...timers].reverse().find((timer) => timer.delayMs === 10_000 && !timer.cleared);
+      assert.ok(renewal);
+      renewal.callback();
+    }
+    setNow(NOW + 31_000);
+    assert.equal(tryAcquireRefreshLease("codex", "second-process", NOW + 31_000), false);
+    assert.ok((readSharedUsageCache()?.refreshLeases?.codex?.expiresAt ?? 0) > NOW + 31_000);
+
+    resolveQuery({ ok: true, report: codexReport(NOW + 31_000) });
+    await refresh;
   });
 });
 
@@ -224,15 +282,31 @@ void test("a foreign lease suppresses duplicate refresh and retries at lease exp
     await refreshCurrentUsageStatusline(context(codexModel, statuses), codexModel);
 
     assert.equal(queryCalls, 0);
-    assert.equal(statuses.at(-1), "codex 23% 5h (4m old)");
+    assert.equal(statuses.at(-1), "Codex · 5h 23% (4m old)");
     assert.equal(timers.at(-1)?.delayMs, REFRESH_LEASE_MS - 5_000);
+  });
+});
+
+void test("a lease expiring in one millisecond still retries no sooner than ten seconds", async () => {
+  await withHarness(async ({ timers, setQuery }) => {
+    let queryCalls = 0;
+    setQuery(async () => {
+      queryCalls++;
+      return { ok: true, report: codexReport() };
+    });
+    assert.equal(tryAcquireRefreshLease("codex", "foreign", NOW - REFRESH_LEASE_MS + 1), true);
+
+    await refreshCurrentUsageStatusline(context(codexModel, []), codexModel);
+
+    assert.equal(queryCalls, 0);
+    assert.equal(timers.at(-1)?.delayMs, 10_000);
   });
 });
 
 void test("mutation-lock contention fails bounded without starting provider network work", async () => {
   await withHarness(async ({ cacheFile, timers, setQuery }) => {
     const controlFile = `${cacheFile}.control`;
-    const child = startPausedCacheWriter(cacheFile, NOW, "anthropic", "after-acquire", controlFile);
+    const child = startPausedCacheWriter(cacheFile, NOW, "claude", "after-acquire", controlFile);
     let queryCalls = 0;
     setQuery(async () => {
       queryCalls += 1;
@@ -339,13 +413,15 @@ void test("an external Anthropic adapter coordinates with Anthropic lease and ba
     const model = { provider: "claude-bridge", id: "claude-sonnet", name: "Claude Sonnet" };
     const snapshot: ProviderUsageSnapshotV1 = {
       version: 1,
-      provider: "anthropic",
+      provider: "claude",
+      source: "test-adapter",
       capturedAt: NOW,
+      complete: true,
       windows: [{ id: "five_hour", label: "5h", usedPercent: 36, scope: { kind: "account" } }],
     };
     const unregister = getUsageBusV1().register({
       id: "anthropic-coordination",
-      usageProvider: "anthropic",
+      usageProvider: "claude",
       modelProviders: [model.provider],
       refresh: async () => snapshot,
     });
@@ -359,20 +435,22 @@ void test("an external Anthropic adapter coordinates with Anthropic lease and ba
         }),
     );
     saveSharedBackoff("codex", NOW + REFRESH_LEASE_MS, NOW);
-    saveSharedBackoff("anthropic", NOW - 1, NOW);
+    saveSharedBackoff("claude", NOW - 1, NOW);
 
     try {
       const refresh = refreshCurrentUsageStatusline(context(model, []), model);
 
       assert.equal(queryCalls, 1);
       assert.equal(readSharedUsageCache()?.refreshLeases?.codex, undefined);
-      assert.match(readSharedUsageCache()?.refreshLeases?.anthropic?.owner ?? "", /^\d+:[0-9a-f-]+$/i);
+      assert.match(readSharedUsageCache()?.refreshLeases?.claude?.owner ?? "", /^\d+:[0-9a-f-]+$/i);
 
       resolveQuery({
         ok: true,
         report: {
-          provider: "anthropic",
+          provider: "claude",
           source: "external-adapter",
+          snapshotSource: "test-adapter",
+          complete: true,
           modelProviders: [model.provider],
           capturedAt: NOW,
           windows: snapshot.windows,
@@ -381,8 +459,8 @@ void test("an external Anthropic adapter coordinates with Anthropic lease and ba
       await refresh;
 
       assert.equal(readSharedUsageCache()?.backoffUntil?.codex, NOW + REFRESH_LEASE_MS);
-      assert.equal(readSharedUsageCache()?.backoffUntil?.anthropic, undefined);
-      assert.equal(readSharedUsageCache()?.refreshLeases?.anthropic, undefined);
+      assert.equal(readSharedUsageCache()?.backoffUntil?.claude, undefined);
+      assert.equal(readSharedUsageCache()?.refreshLeases?.claude, undefined);
     } finally {
       unregister();
     }
@@ -396,7 +474,9 @@ void test("changing providers cancels the prior timer and clears selected-provid
     const ctx = context(codexModel, statuses);
     await refreshCurrentUsageStatusline(ctx, codexModel);
     const codexTimer = timers.at(-1);
+    const codexCountdownTimer = timers.find((timer) => timer.delayMs === 60_000 && !timer.cleared);
     assert.ok(codexTimer);
+    assert.ok(codexCountdownTimer);
 
     setQuery(async () => ({
       ok: false,
@@ -406,8 +486,9 @@ void test("changing providers cancels the prior timer and clears selected-provid
     await refreshCurrentUsageStatusline(ctx, anthropicModel);
 
     assert.equal(codexTimer.cleared, true);
+    assert.equal(codexCountdownTimer.cleared, true);
     assert.deepEqual(statuses.slice(-3), [undefined, "checking", "usage error"]);
-    assert.equal(statuses.includes("codex 23% 5h (4m old)"), false);
+    assert.equal(statuses.includes("Codex · 5h 23% (4m old)"), false);
   });
 });
 
@@ -421,8 +502,10 @@ void test("a non-selected adapter snapshot updates cache without clearing the se
     assert.equal(
       applyProviderUsageSnapshot(ctx, {
         version: 1,
-        provider: "anthropic",
+        provider: "claude",
+        source: "test-adapter",
         capturedAt: NOW,
+        complete: true,
         windows: [
           {
             id: "five_hour",
@@ -435,8 +518,8 @@ void test("a non-selected adapter snapshot updates cache without clearing the se
       false,
     );
 
-    assert.equal(statuses.at(-1), "codex 23% 5h");
-    assert.equal(readSharedUsageCache()?.entries.anthropic?.report.provider, "anthropic");
+    assert.equal(statuses.at(-1), "Codex · 5h 23%");
+    assert.equal(readSharedUsageCache()?.entries.claude?.report.provider, "claude");
   });
 });
 
@@ -444,13 +527,15 @@ void test("a mismatched Codex snapshot does not update a selected custom Anthrop
   await withHarness(async () => {
     const anthropicSnapshot: ProviderUsageSnapshotV1 = {
       version: 1,
-      provider: "anthropic",
+      provider: "claude",
+      source: "test-adapter",
       capturedAt: NOW,
+      complete: true,
       windows: [{ id: "five_hour", label: "5h", usedPercent: 64, scope: { kind: "account" } }],
     };
     const unregister = getUsageBusV1().register({
       id: "claude-mismatch",
-      usageProvider: "anthropic",
+      usageProvider: "claude",
       modelProviders: ["claude-bridge"],
       refresh: async () => anthropicSnapshot,
     });
@@ -465,7 +550,9 @@ void test("a mismatched Codex snapshot does not update a selected custom Anthrop
         applyProviderUsageSnapshot(ctx, {
           version: 1,
           provider: "codex",
+          source: "test-adapter",
           capturedAt: NOW + 1,
+          complete: true,
           windows: [{ id: "five_hour", label: "5h", usedPercent: 82, scope: { kind: "account" } }],
         }),
         false,
@@ -475,6 +562,8 @@ void test("a mismatched Codex snapshot does not update a selected custom Anthrop
       assert.deepEqual(readSharedUsageCache()?.entries.codex?.report, {
         provider: "codex",
         source: "external-adapter",
+        snapshotSource: "test-adapter",
+        complete: true,
         modelProviders: ["openai-codex"],
         capturedAt: NOW + 1,
         windows: [{ id: "five_hour", label: "5h", usedPercent: 82, scope: { kind: "account" } }],
@@ -485,18 +574,84 @@ void test("a mismatched Codex snapshot does not update a selected custom Anthrop
   });
 });
 
+void test("a partial bridge snapshot merges by stable window identity and retains adapter model providers", async () => {
+  await withHarness(async () => {
+    const complete: ProviderUsageSnapshotV1 = {
+      version: 1,
+      provider: "claude",
+      providerLabel: "Claude",
+      source: "claude-code-sdk",
+      capturedAt: NOW,
+      complete: true,
+      adapterId: "schuettc.pi-claude-bridge",
+      windows: [
+        { id: "five_hour", label: "5h", usedPercent: 23, scope: { kind: "account" } },
+        { id: "seven_day", label: "7d", usedPercent: 41, scope: { kind: "account" } },
+        {
+          id: "model_scoped:fable",
+          label: "7d",
+          usedPercent: 67,
+          scope: { kind: "model", modelIds: ["claude-fable-5-1"], label: "Fable" },
+        },
+        { id: "extra_usage", label: "overage", usedPercent: 8, scope: { kind: "overage" } },
+      ],
+    };
+    const unregister = getUsageBusV1().register({
+      id: "schuettc.pi-claude-bridge",
+      usageProvider: "claude",
+      modelProviders: ["claude-bridge"],
+      refresh: async () => complete,
+    });
+    const selectedStatuses: Array<string | undefined> = [];
+    const selected = context({ provider: "claude-bridge", id: "claude-fable-5-1", name: "Fable" }, selectedStatuses);
+
+    try {
+      assert.equal(applyProviderUsageSnapshot(selected, complete), true);
+      const other = context(codexModel, []);
+      assert.equal(
+        applyProviderUsageSnapshot(other, {
+          ...complete,
+          capturedAt: NOW + 1,
+          complete: false,
+          windows: [{ id: "five_hour", label: "5h", usedPercent: 75, state: "warning", scope: { kind: "account" } }],
+        }),
+        false,
+      );
+
+      const report = readSharedUsageCache()?.entries.claude?.report;
+      assert.equal(report?.source, "external-adapter");
+      if (report?.source !== "external-adapter") return;
+      assert.equal(report.adapterId, "schuettc.pi-claude-bridge");
+      assert.deepEqual(report.modelProviders, ["claude-bridge", "anthropic"]);
+      assert.deepEqual(
+        report.windows.map(({ id, usedPercent, state }) => ({ id, usedPercent, state })),
+        [
+          { id: "five_hour", usedPercent: 75, state: "warning" },
+          { id: "seven_day", usedPercent: 41, state: undefined },
+          { id: "model_scoped:fable", usedPercent: 67, state: undefined },
+          { id: "extra_usage", usedPercent: 8, state: undefined },
+        ],
+      );
+    } finally {
+      unregister();
+    }
+  });
+});
+
 void test("adapter snapshot application updates shared cache and the selected footer immediately", async () => {
   await withHarness(async () => {
     const unregister = getUsageBusV1().register({
       id: "claude-bridge",
-      usageProvider: "anthropic",
+      usageProvider: "claude",
       modelProviders: ["claude-bridge"],
       refresh: async () => snapshot,
     });
     const snapshot: ProviderUsageSnapshotV1 = {
       version: 1,
-      provider: "anthropic",
+      provider: "claude",
+      source: "test-adapter",
       capturedAt: NOW,
+      complete: true,
       windows: [
         {
           id: "five_hour",
@@ -512,11 +667,14 @@ void test("adapter snapshot application updates shared cache and the selected fo
     try {
       assert.equal(applyProviderUsageSnapshot(ctx, snapshot), true);
       assert.equal(statuses.at(-1), "Claude · 5h 64%");
-      assert.deepEqual(readSharedUsageCache()?.entries.anthropic, {
+      assert.deepEqual(readSharedUsageCache()?.entries.claude, {
         createdAt: NOW,
         report: {
-          provider: "anthropic",
+          provider: "claude",
           source: "external-adapter",
+          snapshotSource: "test-adapter",
+          adapterId: "claude-bridge",
+          complete: true,
           modelProviders: ["claude-bridge", "anthropic"],
           capturedAt: NOW,
           windows: snapshot.windows,

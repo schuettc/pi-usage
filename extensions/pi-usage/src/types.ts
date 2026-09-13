@@ -41,21 +41,35 @@ export type CodexUsageReport = {
   snapshots: NormalizedRateLimitSnapshot[];
 };
 
-export type UsageScopeV1 = { kind: "account" } | { kind: "model"; modelIds: string[]; label: string };
+export type ProviderKeyV1 = "claude" | "codex";
+export type UsageStateV1 = "available" | "warning" | "rejected" | "unknown";
+export type UsageScopeV1 =
+  | { kind: "account" }
+  | { kind: "model"; modelIds: string[]; label: string }
+  | { kind: "overage" }
+  | { kind: "provider"; id: string; label?: string };
 
 export type NormalizedUsageWindow = {
   id: string;
   label: string;
-  usedPercent: number;
+  usedPercent?: number;
   resetsAt?: number; // epoch seconds
   windowMinutes?: number;
   scope: UsageScopeV1;
+  state?: UsageStateV1;
+  usedAmount?: number;
+  limitAmount?: number;
+  currency?: string;
 };
 
 export type ProviderUsageSnapshotV1 = {
   version: 1;
-  provider: "anthropic" | "codex";
+  provider: ProviderKeyV1;
+  providerLabel?: string;
+  source: string;
   capturedAt: number; // epoch milliseconds
+  complete: boolean;
+  adapterId?: string;
   windows: NormalizedUsageWindow[];
 };
 
@@ -64,21 +78,21 @@ export type ProviderUsageEventV1 =
   | {
       version: 1;
       type: "soft-warning";
-      provider: "anthropic" | "codex";
+      provider: ProviderKeyV1;
       message: string;
       snapshot?: ProviderUsageSnapshotV1;
     }
   | {
       version: 1;
       type: "hard-limit";
-      provider: "anthropic" | "codex";
+      provider: ProviderKeyV1;
       message: string;
       snapshot?: ProviderUsageSnapshotV1;
     };
 
 export type ProviderUsageAdapterV1 = {
   id: string;
-  usageProvider: "anthropic" | "codex";
+  usageProvider: ProviderKeyV1;
   modelProviders: string[];
   refresh(options: { timeoutMs: number; signal?: AbortSignal }): Promise<ProviderUsageSnapshotV1>;
 };
@@ -92,15 +106,19 @@ export type ProviderUsageBusV1 = {
 };
 
 export type AdapterUsageReport = {
-  provider: "anthropic" | "codex";
+  provider: ProviderKeyV1;
+  providerLabel?: string;
   source: "external-adapter";
+  snapshotSource: string;
+  adapterId?: string;
+  complete: boolean;
   modelProviders: string[];
   capturedAt: number;
   windows: NormalizedUsageWindow[];
 };
 
 export type AnthropicUsageReport = {
-  provider: "anthropic";
+  provider: "claude";
   source: "anthropic-oauth";
   capturedAt: number;
   windows: NormalizedUsageWindow[];
@@ -263,15 +281,15 @@ export type CodexResetCreditList = {
   credits: CodexResetCredit[];
 };
 
-export type UsageProviderKey = "codex" | "anthropic";
+export type UsageProviderKey = ProviderKeyV1;
 
 export type SharedCacheEntry = { createdAt: number; report: UsageReport };
 
 export type SharedUsageCache = {
   version: 2;
-  entries: Partial<Record<"codex" | "anthropic", SharedCacheEntry>>;
-  backoffUntil?: Partial<Record<"codex" | "anthropic", number>>;
-  refreshLeases?: Partial<Record<"codex" | "anthropic", { owner: string; expiresAt: number }>>;
+  entries: Partial<Record<ProviderKeyV1, SharedCacheEntry>>;
+  backoffUntil?: Partial<Record<ProviderKeyV1, number>>;
+  refreshLeases?: Partial<Record<ProviderKeyV1, { owner: string; expiresAt: number }>>;
 };
 
 export type FooterTheme = {

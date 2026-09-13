@@ -150,8 +150,11 @@ class CodexAppServerClient {
     this.pending.delete(parsed.id);
 
     if (parsed.error) {
-      const message = typeof parsed.error.message === "string" ? parsed.error.message : "unknown error";
-      pending.reject(new Error(`codex app-server request failed: ${message}`));
+      const code =
+        typeof parsed.error.code === "string" || typeof parsed.error.code === "number"
+          ? ` (code ${String(parsed.error.code)})`
+          : "";
+      pending.reject(new Error(`codex app-server request failed${code}.`));
       return;
     }
 

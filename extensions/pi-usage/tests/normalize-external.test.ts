@@ -9,7 +9,9 @@ function snapshot(overrides: Partial<ProviderUsageSnapshotV1> = {}): ProviderUsa
   return {
     version: 1,
     provider: "codex",
+    source: "test-adapter",
     capturedAt: Date.parse("2026-09-12T13:00:00Z"),
+    complete: true,
     windows: [
       {
         id: "gpt:five_hour",
@@ -47,6 +49,33 @@ void test("rejects non-finite percentages and invalid reset values", () => {
   assert.throws(() => normalizeExternalUsageSnapshot(invalidReset, modelProviders), /resetsAt/i);
 });
 
+void test("rejects every malformed public snapshot and window field", () => {
+  const cases: Array<[string, ProviderUsageSnapshotV1]> = [
+    ["provider", { ...snapshot(), provider: "anthropic" } as never],
+    ["providerLabel", { ...snapshot(), providerLabel: "" }],
+    ["source", { ...snapshot(), source: 1 } as never],
+    ["capturedAt", { ...snapshot(), capturedAt: -1 }],
+    ["adapterId", { ...snapshot(), adapterId: "" }],
+    ["complete", { ...snapshot(), complete: "yes" } as never],
+    ["windows", { ...snapshot(), windows: {} } as never],
+    ["scope", snapshot({ windows: [{ ...snapshot().windows[0], scope: { kind: "other" } as never }] })],
+    [
+      "modelIds",
+      snapshot({
+        windows: [{ ...snapshot().windows[0], scope: { kind: "model", modelIds: [1], label: "bad" } as never }],
+      }),
+    ],
+    ["state", snapshot({ windows: [{ ...snapshot().windows[0], state: "bad" as never }] })],
+    ["usedPercent", snapshot({ windows: [{ ...snapshot().windows[0], usedPercent: "25" as never }] })],
+    ["usedAmount", snapshot({ windows: [{ ...snapshot().windows[0], usedAmount: Number.NaN }] })],
+    ["limitAmount", snapshot({ windows: [{ ...snapshot().windows[0], limitAmount: -1 }] })],
+    ["currency", snapshot({ windows: [{ ...snapshot().windows[0], currency: "" }] })],
+  ];
+  for (const [field, malformed] of cases) {
+    assert.throws(() => normalizeExternalUsageSnapshot(malformed, modelProviders), new RegExp(field, "i"));
+  }
+});
+
 void test("clamps percentages, accepts unknown model labels, and strips extra material", () => {
   const input = {
     ...snapshot(),
@@ -66,6 +95,8 @@ void test("clamps percentages, accepts unknown model labels, and strips extra ma
   assert.deepEqual(normalizeExternalUsageSnapshot(input, modelProviders), {
     provider: "codex",
     source: "external-adapter",
+    snapshotSource: "test-adapter",
+    complete: true,
     modelProviders: ["openai-codex"],
     capturedAt: Date.parse("2026-09-12T13:00:00Z"),
     windows: [

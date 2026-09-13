@@ -9,7 +9,7 @@ import {
 import { CACHE_TTL_MS, COMMAND_NAME } from "./constants.js";
 import { isRateLimitErrorMessage, rateLimitBackoffMs } from "./errors.js";
 import { formatQueryErrors, showReports } from "./format.js";
-import { filterReportsForConfiguredProviders } from "./models.js";
+import { filterReportsForConfiguredProviders, reportMatchesModel } from "./models.js";
 import { queryAllUsage } from "./query.js";
 import {
   clearSharedBackoff,
@@ -114,13 +114,15 @@ export function registerUsageCommand(pi: ExtensionAPI): void {
         }
 
         const combined = getCombinedCache();
-        let cached = combined && Date.now() - combined.createdAt < CACHE_TTL_MS ? combined : undefined;
+        let cached =
+          combined && (options.value.refresh || Date.now() - combined.createdAt < CACHE_TTL_MS) ? combined : undefined;
         if (!cached) {
           // Fall back to reports fetched by other pi sessions.
           const shared = readSharedUsageCache();
           if (shared) {
             const entries = Object.values(shared.entries).filter(
-              (entry): entry is SharedCacheEntry => !!entry && Date.now() - entry.createdAt < CACHE_TTL_MS,
+              (entry): entry is SharedCacheEntry =>
+                !!entry && (options.value.refresh || Date.now() - entry.createdAt < CACHE_TTL_MS),
             );
             if (entries.length > 0) {
               cached = {
@@ -149,44 +151,57 @@ export function registerUsageCommand(pi: ExtensionAPI): void {
         void queryAllUsage(ctx, cmdOptions)
           .then((result) => {
             if (!isSessionActive()) return;
-            const reportedProviders = new Set(result.reports.map((report) => report.provider));
-            if (
-              !reportedProviders.has("anthropic") &&
-              result.errors.some((error) => error.source === "anthropic-oauth")
-            ) {
-              clearSharedUsageReport("anthropic");
-            }
-            if (!reportedProviders.has("codex") && result.errors.some((error) => error.source !== "anthropic-oauth")) {
-              clearSharedUsageReport("codex");
-            }
             if (result.reports.length === 0) {
-              setCombinedCache(undefined);
-              clearStatuslineValue(ctx);
-              ctx.ui.notify(formatQueryErrors(result.errors), "warning");
+              if (cached) {
+                setCombinedCache(cached);
+                applyCurrentProviderStatusline(ctx, cached.reports, { createdAt: cached.createdAt, stale: true });
+                showReports(ctx, cached.reports, true);
+                ctx.ui.notify(`Stale usage data retained.\n${formatQueryErrors(result.errors)}`, "warning");
+              } else {
+                setCombinedCache(undefined);
+                clearStatuslineValue(ctx);
+                ctx.ui.notify(formatQueryErrors(result.errors), "warning");
+              }
               return;
             }
-            setCombinedCache({ createdAt: Date.now(), reports: result.reports });
+            const freshReportKeys = new Set(result.reports.map(reportIdentity));
+            const retained =
+              cmdOptions.refresh && cached
+                ? cached.reports.filter((report) => !freshReportKeys.has(reportIdentity(report)))
+                : [];
+            const reports = [...result.reports, ...retained];
+            setCombinedCache({ createdAt: Date.now(), reports });
             for (const report of result.reports) saveSharedUsageReport(report);
             for (const error of result.errors) {
               if (isRateLimitErrorMessage(error.message)) {
                 saveSharedBackoff(
-                  error.source === "anthropic-oauth" ? "anthropic" : "codex",
+                  error.source === "anthropic-oauth" ? "claude" : "codex",
                   Date.now() + rateLimitBackoffMs([error]),
                 );
               }
             }
-            const kept = applyCurrentProviderStatusline(ctx, result.reports);
+            const selectedIsStale = retained.some((report) => reportMatchesModel(report, ctx.model));
+            const kept = applyCurrentProviderStatusline(
+              ctx,
+              reports,
+              selectedIsStale && cached ? { createdAt: cached.createdAt, stale: true } : undefined,
+            );
             if (!kept) clearStatuslineValue(ctx);
-            showReports(ctx, result.reports, false);
+            showReports(ctx, reports, retained.length > 0);
             // Surface partial failures (e.g. one provider worked, the other didn't).
             if (result.errors.length > 0) {
               ctx.ui.notify(formatQueryErrors(result.errors, true), "warning");
             }
           })
           .catch((error: unknown) => {
-            clearStatuslineValue(ctx);
-            if (!handleStaleContextError(ctx, error)) {
-              ctx.ui.notify(errorMessage(error), "error");
+            if (cached) {
+              setCombinedCache(cached);
+              applyCurrentProviderStatusline(ctx, cached.reports, { createdAt: cached.createdAt, stale: true });
+              showReports(ctx, cached.reports, true);
+              ctx.ui.notify(`Stale usage data retained.\n${errorMessage(error)}`, "warning");
+            } else {
+              clearStatuslineValue(ctx);
+              if (!handleStaleContextError(ctx, error)) ctx.ui.notify(errorMessage(error), "error");
             }
           });
         // Return right away — the fetch continues in the background.
@@ -196,4 +211,10 @@ export function registerUsageCommand(pi: ExtensionAPI): void {
       }
     },
   });
+}
+
+function reportIdentity(report: import("./types.js").UsageReport): string {
+  return report.source === "external-adapter"
+    ? `external:${report.adapterId ?? report.modelProviders.slice().sort().join(",")}`
+    : report.source;
 }

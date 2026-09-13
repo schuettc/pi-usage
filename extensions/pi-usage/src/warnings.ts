@@ -12,7 +12,7 @@ type ProviderWarningMarker = {
 const shownSoftWarnings = new WeakMap<ExtensionAPI, Set<UsageProviderKey>>();
 
 function isUsageProvider(value: unknown): value is UsageProviderKey {
-  return value === "anthropic" || value === "codex";
+  return value === "claude" || value === "codex";
 }
 
 /** Rebuild the per-session warning allowance from durable custom entries. */

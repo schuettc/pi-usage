@@ -71,25 +71,43 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isNormalizedWindow(value: unknown): boolean {
-  if (!isRecord(value) || typeof value.id !== "string" || typeof value.label !== "string") return false;
-  if (typeof value.usedPercent !== "number" || !Number.isFinite(value.usedPercent)) return false;
-  if (value.resetsAt !== undefined && (typeof value.resetsAt !== "number" || !Number.isFinite(value.resetsAt))) {
+  if (!isRecord(value) || !nonEmptyString(value.id) || !nonEmptyString(value.label)) return false;
+  for (const field of ["usedPercent", "resetsAt", "usedAmount", "limitAmount"] as const) {
+    if (value[field] !== undefined && !finiteNonNegative(value[field])) return false;
+  }
+  if (value.windowMinutes !== undefined && (!finiteNonNegative(value.windowMinutes) || value.windowMinutes === 0)) {
     return false;
   }
   if (
-    value.windowMinutes !== undefined &&
-    (typeof value.windowMinutes !== "number" || !Number.isFinite(value.windowMinutes))
+    value.state !== undefined &&
+    value.state !== "available" &&
+    value.state !== "warning" &&
+    value.state !== "rejected" &&
+    value.state !== "unknown"
   ) {
     return false;
   }
+  if (value.currency !== undefined && !nonEmptyString(value.currency)) return false;
   if (!isRecord(value.scope)) return false;
-  if (value.scope.kind === "account") return true;
+  if (value.scope.kind === "account" || value.scope.kind === "overage") return true;
+  if (value.scope.kind === "provider") {
+    return nonEmptyString(value.scope.id) && (value.scope.label === undefined || nonEmptyString(value.scope.label));
+  }
   return (
     value.scope.kind === "model" &&
-    typeof value.scope.label === "string" &&
+    nonEmptyString(value.scope.label) &&
     Array.isArray(value.scope.modelIds) &&
-    value.scope.modelIds.every((modelId) => typeof modelId === "string")
+    value.scope.modelIds.length > 0 &&
+    value.scope.modelIds.every(nonEmptyString)
   );
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function finiteNonNegative(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
 function isCodexWindow(value: unknown): boolean {
@@ -126,13 +144,18 @@ function isUsageReport(value: unknown, provider: UsageProviderKey): value is Usa
 
   if (value.source === "external-adapter") {
     return (
+      (value.providerLabel === undefined || nonEmptyString(value.providerLabel)) &&
+      nonEmptyString(value.snapshotSource) &&
+      (value.adapterId === undefined || nonEmptyString(value.adapterId)) &&
+      typeof value.complete === "boolean" &&
       Array.isArray(value.modelProviders) &&
-      value.modelProviders.every((modelProvider) => typeof modelProvider === "string") &&
+      value.modelProviders.length > 0 &&
+      value.modelProviders.every(nonEmptyString) &&
       Array.isArray(value.windows) &&
       value.windows.every(isNormalizedWindow)
     );
   }
-  if (provider === "anthropic" && value.source === "anthropic-oauth") {
+  if (provider === "claude" && value.source === "anthropic-oauth") {
     return (
       Array.isArray(value.windows) &&
       value.windows.every(isNormalizedWindow) &&
@@ -160,7 +183,7 @@ function isSharedCacheEntry(value: unknown, provider: UsageProviderKey): value i
 
 function isProviderNumberMap(value: unknown): boolean {
   if (!isRecord(value)) return false;
-  return (["codex", "anthropic"] as const).every((provider) => {
+  return (["codex", "claude"] as const).every((provider) => {
     const item = value[provider];
     return item === undefined || (typeof item === "number" && Number.isFinite(item));
   });
@@ -168,7 +191,7 @@ function isProviderNumberMap(value: unknown): boolean {
 
 function isRefreshLeaseMap(value: unknown): boolean {
   if (!isRecord(value)) return false;
-  return (["codex", "anthropic"] as const).every((provider) => {
+  return (["codex", "claude"] as const).every((provider) => {
     const lease = value[provider];
     return (
       lease === undefined ||
@@ -182,7 +205,7 @@ function isRefreshLeaseMap(value: unknown): boolean {
 
 function isSharedUsageCache(value: unknown): value is SharedUsageCache {
   if (!isRecord(value) || value.version !== SHARED_CACHE_VERSION || !isRecord(value.entries)) return false;
-  for (const provider of ["codex", "anthropic"] as const) {
+  for (const provider of ["codex", "claude"] as const) {
     const entry = value.entries[provider];
     if (entry !== undefined && !isSharedCacheEntry(entry, provider)) return false;
   }
@@ -360,6 +383,10 @@ export function sharedBackoffRemainingMs(provider: UsageProviderKey, now: number
   }
 }
 
+export function isSharedCacheMutationAvailable(): boolean {
+  return resolveMutationLockBackend() !== undefined;
+}
+
 export function tryAcquireRefreshLease(provider: UsageProviderKey, owner: string, now: number): boolean {
   const expiresAt = now + REFRESH_LEASE_MS;
   if (!owner || !Number.isFinite(now) || !Number.isFinite(expiresAt)) return false;
@@ -370,6 +397,16 @@ export function tryAcquireRefreshLease(provider: UsageProviderKey, owner: string
       ...(cacheFile.refreshLeases ?? {}),
       [provider]: { owner, expiresAt },
     };
+    return { changed: true, value: true };
+  });
+}
+
+export function renewRefreshLease(provider: UsageProviderKey, owner: string, now: number): boolean {
+  if (!owner || !Number.isFinite(now)) return false;
+  return mutateSharedUsageCache(false, (cacheFile) => {
+    const current = cacheFile.refreshLeases?.[provider];
+    if (!current || current.owner !== owner) return { changed: false, value: false };
+    current.expiresAt = now + REFRESH_LEASE_MS;
     return { changed: true, value: true };
   });
 }

@@ -11,6 +11,7 @@ SYNC_CLEANUP_REPOSITORY=''
 SYNC_CLEANUP_WORKTREE=''
 SYNC_CLEANUP_ROOT=''
 FIXTURE_CLEANUP_ROOT=''
+FORCE_PUBLISH=0
 
 fail() {
   printf 'upstream-sync: %s\n' "$*" >&2
@@ -249,7 +250,7 @@ run_sync() {
     return 1
   fi
 
-  if [ "$base_commit" = "$upstream_tip" ]; then
+  if [ "$base_commit" = "$upstream_tip" ] && [ "$FORCE_PUBLISH" != '1' ]; then
     printf 'upstream/master has not moved; nothing to publish\n'
     printf 'SYNC_STATUS=no-op\n'
     return 0
@@ -320,6 +321,11 @@ run_sync() {
     cd "$sync_worktree"
     npm ci
     npm run check
+    if [ -n "${PI_USAGE_ARTIFACT_VERIFY:-}" ]; then
+      "$PI_USAGE_ARTIFACT_VERIFY"
+    else
+      node .github/scripts/verify-pi-usage-pack.mjs
+    fi
   )
 
   git -C "$sync_worktree" add -- "$PACKAGE_JSON" "$LOCK_JSON"
@@ -412,6 +418,17 @@ assert_workflow_contracts() {
   assert_contains "$sync_workflow" 'gh issue' 'failure reporting uses gh without relying on checkout'
   assert_contains "$sync_workflow" 'if: success()' 'failure issue closes only after complete success'
   assert_not_contains "$sync_workflow" 'continue-on-error:' 'step failures remain visible to failure()'
+  assert_contains "$sync_workflow" 'force_publish:' 'manual synchronization exposes force_publish'
+  assert_contains "$sync_workflow" 'secrets.PI_USAGE_SYNC_TOKEN' 'sync checkout and push use the dedicated token'
+  assert_contains "$sync_workflow" 'token: ${{ secrets.PI_USAGE_SYNC_TOKEN }}' 'checkout persists the dedicated sync token'
+  assert_contains "$publish_workflow" 'cancel-in-progress: false' 'publication concurrency never cancels an active publish'
+  assert_contains "$publish_workflow" '[publish-pi-usage] Publication failed' 'publish failures use one durable issue'
+  assert_contains "$publish_workflow" 'if: always() && failure()' 'publish failures are reported from every phase'
+  assert_contains "$publish_workflow" 'if: success()' 'a successful rerun closes the publish failure issue'
+  assert_contains "$SCRIPT_PATH" 'verify-pi-usage-pack.mjs' 'sync runs artifact verification before moving refs'
+  local repository_root
+  repository_root="$(cd "$(dirname "$SCRIPT_PATH")/../.." && pwd)"
+  assert_contains "$repository_root/package.json" '"pack:usage": "npm --workspace @schuettc/pi-usage pack --dry-run"' 'root pack:usage selects the maintained package'
 
   # These are literal GitHub Actions and shell expressions in the workflow file.
   # shellcheck disable=SC2016
@@ -468,7 +485,22 @@ fixture_run_sync() {
     cd "$repository"
     PI_USAGE_NPM_VERSION_LOOKUP="$lookup" \
       PI_USAGE_LOOKUP_LOG="$lookup_log" \
+      PI_USAGE_ARTIFACT_VERIFY="${FIXTURE_ARTIFACT_VERIFY:-}" \
       bash "$SCRIPT_PATH" --dry-run
+  ) >"$output" 2>&1
+}
+
+fixture_run_sync_force() {
+  local repository="$1"
+  local lookup="$2"
+  local lookup_log="$3"
+  local output="$4"
+  (
+    cd "$repository"
+    PI_USAGE_NPM_VERSION_LOOKUP="$lookup" \
+      PI_USAGE_LOOKUP_LOG="$lookup_log" \
+      PI_USAGE_ARTIFACT_VERIFY="${FIXTURE_ARTIFACT_VERIFY:-}" \
+      bash "$SCRIPT_PATH" --force-dry-run
   ) >"$output" 2>&1
 }
 
@@ -481,6 +513,7 @@ fixture_run_sync_publish() {
     cd "$repository"
     PI_USAGE_NPM_VERSION_LOOKUP="$lookup" \
       PI_USAGE_LOOKUP_LOG="$lookup_log" \
+      PI_USAGE_ARTIFACT_VERIFY="${FIXTURE_ARTIFACT_VERIFY:-}" \
       bash "$SCRIPT_PATH"
   ) >"$output" 2>&1
 }
@@ -506,6 +539,8 @@ run_fixture_tests() {
   local runner="$fixture_root/runner"
   local lookup="$fixture_root/npm-version-lookup.sh"
   local lookup_log="$fixture_root/npm-version-lookup.log"
+  local artifact_log="$fixture_root/artifact-verify.log"
+  local artifact_verify="$fixture_root/artifact-verify.sh"
   local output="$fixture_root/sync.out"
 
   git init --bare -q "$upstream_bare"
@@ -550,6 +585,14 @@ printf '%s\n' "$1" >> "$PI_USAGE_LOOKUP_LOG"
 printf '%s\n' '["1.0.0-schuettc.500", "1.1.0-schuettc.2", "1.1.0-schuettc.7"]'
 LOOKUP
   chmod +x "$lookup"
+  cat > "$artifact_verify" <<'VERIFY'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'artifact verified\n' >> "$PI_USAGE_ARTIFACT_LOG"
+VERIFY
+  chmod +x "$artifact_verify"
+  export FIXTURE_ARTIFACT_VERIFY="$artifact_verify"
+  export PI_USAGE_ARTIFACT_LOG="$artifact_log"
   printf '[]\n' > "$fixture_root/empty-versions.json"
   assert_eq '1' "$(next_published_suffix '2.0.0' "$fixture_root/empty-versions.json")" 'an unpublished upstream version starts at suffix 1'
 
@@ -560,6 +603,33 @@ LOOKUP
   fi
   assert_eq "$prior_release" "$(git ls-remote "$origin_bare" "refs/heads/$PUBLICATION_BRANCH" | awk '{print $1}')" 'no-op did not push the publication branch'
   assert_eq "$base_commit" "$(git ls-remote "$origin_bare" "refs/tags/$UPSTREAM_TAG^{}" | awk '{print $1}')" 'no-op did not move the upstream-base tag'
+
+  : > "$lookup_log"
+  : > "$artifact_log"
+  if ! fixture_run_sync_force "$runner" "$lookup" "$lookup_log" "$output"; then
+    cat "$output" >&2
+    return 1
+  fi
+  assert_contains "$output" 'SYNC_STATUS=changed' 'force rebuilds an unchanged upstream patch stack'
+  assert_contains "$output" 'SYNC_VERSION=1.0.0-schuettc.501' 'force allocates the next published suffix'
+  assert_contains "$artifact_log" 'artifact verified' 'artifact verification runs before a forced release'
+  assert_eq "$prior_release" "$(git ls-remote "$origin_bare" "refs/heads/$PUBLICATION_BRANCH" | awk '{print $1}')" 'force dry-run did not push the publication branch'
+
+  cat > "$artifact_verify" <<'VERIFY_FAIL'
+#!/usr/bin/env bash
+exit 23
+VERIFY_FAIL
+  chmod +x "$artifact_verify"
+  if fixture_run_sync_force "$runner" "$lookup" "$lookup_log" "$output"; then
+    fail 'fixture assertion failed: artifact verifier failure was accepted'
+  fi
+  assert_eq "$prior_release" "$(git ls-remote "$origin_bare" "refs/heads/$PUBLICATION_BRANCH" | awk '{print $1}')" 'artifact failure did not move the publication branch'
+  cat > "$artifact_verify" <<'VERIFY'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'artifact verified\n' >> "$PI_USAGE_ARTIFACT_LOG"
+VERIFY
+  chmod +x "$artifact_verify"
 
   write_fixture_manifest "$seed" '@sreetej510/pi-usage' '1.1.0'
   printf 'new upstream content\n' > "$seed/upstream-only.txt"
@@ -674,6 +744,20 @@ case "${1:-}" in
       exit 2
     fi
     PI_USAGE_SYNC_DRY_RUN=1 run_sync
+    ;;
+  --force)
+    if [ "$#" -ne 1 ]; then
+      fail '--force does not accept additional arguments'
+      exit 2
+    fi
+    FORCE_PUBLISH=1 run_sync
+    ;;
+  --force-dry-run)
+    if [ "$#" -ne 1 ]; then
+      fail '--force-dry-run does not accept additional arguments'
+      exit 2
+    fi
+    FORCE_PUBLISH=1 PI_USAGE_SYNC_DRY_RUN=1 run_sync
     ;;
   '')
     run_sync

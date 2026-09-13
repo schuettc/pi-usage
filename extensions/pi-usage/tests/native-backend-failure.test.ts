@@ -55,7 +55,15 @@ void test("a require setup failure is lazy, contained, and cached", async () => 
     assert.doesNotThrow(() => sharedCache.releaseRefreshLease("codex", "test-owner"));
     assert.deepEqual(JSON.parse(readFileSync(cacheFile, "utf8")), original);
     assert.equal(requireFactoryAttempts, 1, "a failed require setup is cached and never retried");
-    assert.equal(providerQueryCalls, 0);
+
+    const statuses: Array<string | undefined> = [];
+    statusline.setSessionActive(true);
+    await statusline.refreshCurrentUsageStatusline({
+      model: { provider: "openai-codex", id: "gpt-5", name: "GPT-5" },
+      ui: { setStatus: (_key: string, value: string | undefined) => statuses.push(value) },
+    } as never);
+    assert.equal(providerQueryCalls, 1, "missing flock falls back to an uncoordinated provider refresh");
+    assert.deepEqual(statuses, ["checking", "usage error"]);
   } finally {
     backendRuntime.configureMutationLockRequireFactoryForTests();
     const sharedCache = await import("../src/shared-cache.js").catch(() => undefined);

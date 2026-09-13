@@ -19,7 +19,9 @@ function usageSnapshot(usedPercent = 32): ProviderUsageSnapshotV1 {
   return {
     version: 1,
     provider: "codex",
+    source: "test-adapter",
     capturedAt: Date.parse("2026-09-12T13:00:00Z"),
+    complete: true,
     windows: [
       {
         id: "gpt:five_hour",
@@ -197,6 +199,9 @@ void test("supports and queries a non-native model through its adapter", async (
       report: {
         provider: "codex",
         source: "external-adapter",
+        snapshotSource: "test-adapter",
+        adapterId: "query-bridge",
+        complete: true,
         modelProviders: ["bridge-provider"],
         capturedAt: Date.parse("2026-09-12T13:00:00Z"),
         windows: [
@@ -220,9 +225,9 @@ void test("keeps a successful claude-bridge adapter report selected in the statu
         ["claude-bridge"],
         async () => ({
           ...usageSnapshot(64),
-          provider: "anthropic",
+          provider: "claude",
         }),
-        "anthropic",
+        "claude",
       ),
     );
     const statuses: Array<string | undefined> = [];
@@ -238,8 +243,11 @@ void test("keeps a successful claude-bridge adapter report selected in the statu
     if (!result.ok) return;
 
     assert.deepEqual(result.report, {
-      provider: "anthropic",
+      provider: "claude",
       source: "external-adapter",
+      snapshotSource: "test-adapter",
+      adapterId: "claude-bridge-adapter",
+      complete: true,
       modelProviders: ["claude-bridge"],
       capturedAt: Date.parse("2026-09-12T13:00:00Z"),
       windows: [

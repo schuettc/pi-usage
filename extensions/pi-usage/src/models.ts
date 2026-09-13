@@ -1,4 +1,4 @@
-import { getUsageBusV1 } from "./adapter-bus.js";
+import { getUsageAdaptersV1 } from "./adapter-bus.js";
 import { ANTHROPIC_PROVIDER_ID, CODEX_PROVIDER_ID } from "./constants.js";
 import type { PiModel, UsageReport } from "./types.js";
 
@@ -13,9 +13,7 @@ export function isAnthropicModel(model: Pick<PiModel, "provider"> | undefined): 
 export function isUsageSupportedModel(model: Pick<PiModel, "provider"> | undefined): boolean {
   if (!model) return false;
   if (isOpenAICodexModel(model) || isAnthropicModel(model)) return true;
-  return getUsageBusV1()
-    .adapters()
-    .some((adapter) => adapter.modelProviders.includes(model.provider));
+  return getUsageAdaptersV1().some((adapter) => adapter.modelProviders.includes(model.provider));
 }
 
 export function reportMatchesModel(report: UsageReport, model: Pick<PiModel, "provider"> | undefined): boolean {
@@ -27,8 +25,8 @@ export function reportMatchesModel(report: UsageReport, model: Pick<PiModel, "pr
   return isAnthropicModel(model);
 }
 
-export function providerKeyForModel(model: Pick<PiModel, "provider"> | undefined): "codex" | "anthropic" {
-  if (isAnthropicModel(model)) return "anthropic";
+export function providerKeyForModel(model: Pick<PiModel, "provider"> | undefined): "codex" | "claude" {
+  if (isAnthropicModel(model)) return "claude";
   return "codex";
 }
 
@@ -50,9 +48,13 @@ export function anthropicAuthCandidateModels(ctx: AuthCandidateContext): PiModel
 export function filterReportsForConfiguredProviders(ctx: AuthCandidateContext, reports: UsageReport[]): UsageReport[] {
   const hasCodex = codexAuthCandidateModels(ctx).length > 0;
   const hasAnthropic = anthropicAuthCandidateModels(ctx).length > 0;
-  return reports.filter(
-    (report) => (report.provider === "codex" && hasCodex) || (report.provider === "anthropic" && hasAnthropic),
-  );
+  const adapterProviders = new Set(getUsageAdaptersV1().flatMap((adapter) => adapter.modelProviders));
+  return reports.filter((report) => {
+    if (report.source === "external-adapter") {
+      return report.modelProviders.some((provider) => adapterProviders.has(provider));
+    }
+    return (report.provider === "codex" && hasCodex) || (report.provider === "claude" && hasAnthropic);
+  });
 }
 
 function providerAuthCandidateModels(ctx: AuthCandidateContext, providerId: string): PiModel[] {
