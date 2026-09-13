@@ -422,6 +422,7 @@ assert_workflow_contracts() {
   assert_contains "$sync_workflow" 'secrets.PI_USAGE_SYNC_TOKEN' 'sync checkout and push use the dedicated token'
   assert_contains "$sync_workflow" 'token: ${{ secrets.PI_USAGE_SYNC_TOKEN }}' 'checkout persists the dedicated sync token'
   assert_contains "$publish_workflow" 'cancel-in-progress: false' 'publication concurrency never cancels an active publish'
+  assert_contains "$publish_workflow" 'npm publish --workspace @schuettc/pi-usage --access public --tag latest --provenance' 'prerelease publication uses an explicit npm tag'
   assert_contains "$publish_workflow" '[publish-pi-usage] Publication failed' 'publish failures use one durable issue'
   assert_contains "$publish_workflow" 'if: always() && failure()' 'publish failures are reported from every phase'
   assert_contains "$publish_workflow" 'if: success()' 'a successful rerun closes the publish failure issue'
