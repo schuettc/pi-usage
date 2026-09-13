@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import { dirname } from "node:path";
 import type { flockSync as NativeFlockSync } from "fs-ext-extra-prebuilt";
 import {
@@ -11,12 +10,12 @@ import {
   SHARED_CACHE_VERSION,
 } from "./constants.js";
 import { reportMatchesModel } from "./models.js";
+import { getMutationLockRequireFactory } from "./mutation-lock-backend.js";
 import type { ProviderUsageModel, SharedCacheEntry, SharedUsageCache, UsageProviderKey, UsageReport } from "./types.js";
 
 const MUTATION_LOCK_RETRY_MS = 5;
 const MUTATION_LOCK_ATTEMPTS = 11;
 const mutationLockWaitArray = new Int32Array(new SharedArrayBuffer(4));
-const require = createRequire(import.meta.url);
 type FlockSync = typeof NativeFlockSync;
 let mutationLockBackend: FlockSync | undefined;
 let mutationLockBackendResolved = false;
@@ -29,6 +28,8 @@ function resolveMutationLockBackend(): FlockSync | undefined {
   if (mutationLockBackendResolved) return mutationLockBackend;
   mutationLockBackendResolved = true;
   try {
+    const createRequire = getMutationLockRequireFactory();
+    const require = createRequire(import.meta.url);
     const candidate: unknown = require("fs-ext-extra-prebuilt");
     if (typeof candidate !== "object" || candidate === null) return undefined;
     const flockSync = Reflect.get(candidate, "flockSync");
