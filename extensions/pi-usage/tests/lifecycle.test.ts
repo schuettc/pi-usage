@@ -21,7 +21,9 @@ const softWarning: ProviderUsageEventV1 = {
   message: "Codex soft warning",
 };
 
-type LifecycleEvent = "session_start" | "session_shutdown";
+type LifecycleEvent =
+  | { type: "session_start"; reason: "startup" | "reload" | "new" | "resume" | "fork" }
+  | { type: "session_shutdown"; reason: "quit" | "reload" | "new" | "resume" | "fork" };
 type LifecycleHandler = (event: unknown, ctx: ExtensionContext) => void | Promise<void>;
 type FakePi = {
   api: ExtensionAPI;
@@ -45,7 +47,7 @@ function fakePi(): FakePi {
     api,
     appended,
     emit: async (event, ctx) => {
-      for (const handler of handlers.get(event) ?? []) await handler({ type: event }, ctx);
+      for (const handler of handlers.get(event.type) ?? []) await handler(event, ctx);
     },
   };
 }
@@ -74,7 +76,7 @@ async function withCleanBus(run: () => void | Promise<void>): Promise<void> {
   }
 }
 
-void test("restores warning markers before subscribing on session start", async () => {
+void test("restores warning markers before subscribing when a session resumes", async () => {
   await withCleanBus(async () => {
     const notifications: string[] = [];
     let subscribeCalls = 0;
@@ -98,11 +100,31 @@ void test("restores warning markers before subscribing on session start", async 
       data: { provider: "codex", shownAt: 1 },
     };
 
-    await pi.emit("session_start", context([marker], notifications));
+    await pi.emit({ type: "session_start", reason: "resume" }, context([marker], notifications));
 
     assert.equal(subscribeCalls, 1);
     assert.deepEqual(notifications, []);
     assert.deepEqual(pi.appended, []);
+  });
+});
+
+void test("starts a fork with a fresh allowance despite inherited warning markers", async () => {
+  await withCleanBus(async () => {
+    const notifications: string[] = [];
+    const pi = fakePi();
+    usageExtension(pi.api);
+    const inheritedMarker = {
+      type: "custom",
+      customType: PROVIDER_USAGE_WARNING_ENTRY_TYPE,
+      data: { provider: "codex", shownAt: 1 },
+    };
+
+    await pi.emit({ type: "session_start", reason: "fork" }, context([inheritedMarker], notifications));
+    const bus = getUsageBusV1();
+    assert.equal(bus.publish(softWarning), 1);
+
+    assert.deepEqual(notifications, ["Codex soft warning"]);
+    assert.equal(pi.appended.length, 1);
   });
 });
 
@@ -115,17 +137,17 @@ void test("replaces the old session listener, resets unmarked allowances, and un
     const firstContext = context([], firstNotifications);
     const secondContext = context([], secondNotifications);
 
-    await pi.emit("session_start", firstContext);
+    await pi.emit({ type: "session_start", reason: "startup" }, firstContext);
     const bus = getUsageBusV1();
     assert.equal(bus.publish(softWarning), 1);
     assert.deepEqual(firstNotifications, ["Codex soft warning"]);
 
-    await pi.emit("session_start", secondContext);
+    await pi.emit({ type: "session_start", reason: "new" }, secondContext);
     assert.equal(bus.publish(softWarning), 1);
     assert.deepEqual(firstNotifications, ["Codex soft warning"]);
     assert.deepEqual(secondNotifications, ["Codex soft warning"]);
 
-    await pi.emit("session_shutdown", secondContext);
+    await pi.emit({ type: "session_shutdown", reason: "quit" }, secondContext);
     assert.equal(bus.publish(hardLimit), 0);
     assert.equal(pi.appended.length, 2);
   });
@@ -148,7 +170,7 @@ void test("contains a stale subscribed context and removes its listener", async 
     const pi = fakePi();
     usageExtension(pi.api);
 
-    await pi.emit("session_start", staleContext);
+    await pi.emit({ type: "session_start", reason: "startup" }, staleContext);
     const bus = getUsageBusV1();
     assert.equal(bus.publish(hardLimit), 1);
     assert.equal(bus.publish(hardLimit), 0);
@@ -161,7 +183,7 @@ void test("runs standalone by creating a bus when no bridge adapter is present",
     const pi = fakePi();
     usageExtension(pi.api);
 
-    await pi.emit("session_start", context([], notifications));
+    await pi.emit({ type: "session_start", reason: "startup" }, context([], notifications));
     const bus = getUsageBusV1();
 
     assert.deepEqual(bus.adapters(), []);

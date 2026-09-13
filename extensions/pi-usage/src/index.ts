@@ -41,7 +41,7 @@ import {
   rethrowUnlessStaleContextError,
   setSessionActive,
 } from "./statusline.js";
-import { handleProviderUsageEvent, restoreProviderWarningState } from "./warnings.js";
+import { handleProviderUsageEvent, resetProviderWarningState, restoreProviderWarningState } from "./warnings.js";
 
 export { completeCodexStatusArguments, parseArgs } from "./args.js";
 export { isStaleExtensionContextError } from "./errors.js";
@@ -68,10 +68,11 @@ export default function usageExtension(pi: ExtensionAPI) {
     subscription?.unsubscribe?.();
   };
 
-  const startProviderUsageSubscription = (ctx: ExtensionContext) => {
+  const startProviderUsageSubscription = (ctx: ExtensionContext, restoreMarkers: boolean) => {
     stopProviderUsageSubscription();
     try {
-      restoreProviderWarningState(pi, ctx);
+      if (restoreMarkers) restoreProviderWarningState(pi, ctx);
+      else resetProviderWarningState(pi);
       const subscription: ProviderUsageSubscription = {};
       activeProviderUsageSubscription = subscription;
       const unsubscribe = getUsageBusV1().subscribe((event) => {
@@ -104,10 +105,10 @@ export default function usageExtension(pi: ExtensionAPI) {
     }
   };
 
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", (event, ctx) => {
     setSessionActive(true);
     ensureUsageFooter(ctx);
-    startProviderUsageSubscription(ctx);
+    startProviderUsageSubscription(ctx, event.reason !== "fork");
     if (isUsageSupportedModel(ctx.model)) {
       void refreshCurrentUsageStatusline(ctx, ctx.model).catch(rethrowUnlessStaleContextError(ctx));
     } else {

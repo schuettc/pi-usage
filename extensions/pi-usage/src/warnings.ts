@@ -23,9 +23,15 @@ export function restoreProviderWarningState(pi: ExtensionAPI, ctx: ExtensionCont
     const data = entry.data;
     if (typeof data !== "object" || data === null) continue;
     const provider = Reflect.get(data, "provider");
-    if (isUsageProvider(provider)) restored.add(provider);
+    const shownAt = Reflect.get(data, "shownAt");
+    if (isUsageProvider(provider) && typeof shownAt === "number" && Number.isFinite(shownAt)) restored.add(provider);
   }
   shownSoftWarnings.set(pi, restored);
+}
+
+/** Start a session with no inherited warning allowance consumption. */
+export function resetProviderWarningState(pi: ExtensionAPI): void {
+  shownSoftWarnings.set(pi, new Set());
 }
 
 /** Apply all attached usage data, then present the event under the durable

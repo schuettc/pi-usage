@@ -172,6 +172,50 @@ void test("restores durable markers and gives an unmarked session a fresh allowa
   });
 });
 
+void test("ignores warning markers without a recognized provider and finite numeric shownAt", async () => {
+  await withIsolatedUsageCache(() => {
+    const harness = createHarness([
+      {
+        type: "custom",
+        customType: PROVIDER_USAGE_WARNING_ENTRY_TYPE,
+        data: { provider: "codex" },
+      },
+      {
+        type: "custom",
+        customType: PROVIDER_USAGE_WARNING_ENTRY_TYPE,
+        data: { provider: "codex", shownAt: "yesterday" },
+      },
+      {
+        type: "custom",
+        customType: PROVIDER_USAGE_WARNING_ENTRY_TYPE,
+        data: { provider: "codex", shownAt: Number.NaN },
+      },
+      {
+        type: "custom",
+        customType: PROVIDER_USAGE_WARNING_ENTRY_TYPE,
+        data: { provider: "codex", shownAt: Number.POSITIVE_INFINITY },
+      },
+      {
+        type: "custom",
+        customType: PROVIDER_USAGE_WARNING_ENTRY_TYPE,
+        data: { provider: "other", shownAt: NOW },
+      },
+      {
+        type: "custom",
+        customType: PROVIDER_USAGE_WARNING_ENTRY_TYPE,
+        data: { provider: "anthropic", shownAt: NOW },
+      },
+    ]);
+
+    restoreProviderWarningState(harness.pi, harness.ctx);
+    handleProviderUsageEvent(harness.pi, harness.ctx, warning("codex", "Codex warning"));
+    handleProviderUsageEvent(harness.pi, harness.ctx, warning("anthropic", "Anthropic repeat"));
+
+    assert.deepEqual(harness.notifications, [{ message: "Codex warning", level: "warning" }]);
+    assert.equal(harness.markers.length, 1);
+  });
+});
+
 void test("shows every hard limit without consuming the soft-warning allowance", async () => {
   await withIsolatedUsageCache(() => {
     const harness = createHarness();
