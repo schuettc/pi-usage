@@ -1,0 +1,128 @@
+name: Synchronize pi-usage with upstream
+
+on:
+  schedule:
+    - cron: '17 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: pi-usage-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  synchronize:
+    name: Rebuild publication branch
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Configure upstream remote
+        run: git remote add upstream https://github.com/Sreetej510/pi-extensions.git
+
+      - name: Test synchronization fixture
+        id: fixture
+        continue-on-error: true
+        run: bash .github/scripts/upstream-sync.sh --fixture-test
+
+      - name: Synchronize upstream
+        id: sync
+        if: steps.fixture.outcome == 'success'
+        continue-on-error: true
+        run: bash .github/scripts/upstream-sync.sh
+
+      - name: Create or update synchronization failure issue
+        if: always() && (steps.fixture.outcome == 'failure' || steps.sync.outcome == 'failure')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = "[upstream-sync] Synchronization failed";
+            const label = "upstream-sync";
+            const { owner, repo } = context.repo;
+            const fixture = "${{ steps.fixture.outcome }}";
+            const sync = "${{ steps.sync.outcome }}";
+            const body = [
+              "The deterministic pi-usage upstream synchronization failed.",
+              "",
+              `- Fixture test: \`${fixture}\``,
+              `- Live synchronization: \`${sync}\``,
+              `- Run: ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+              "",
+              "Inspect the failed run and resolve the patch-stack or infrastructure error. Later success closes this issue automatically.",
+            ].join("\n");
+
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: label });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.issues.createLabel({
+                owner,
+                repo,
+                name: label,
+                color: "B60205",
+                description: "Automated upstream synchronization failure",
+              });
+            }
+
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: "all",
+              per_page: 100,
+            });
+            const existing = issues.find((issue) => !issue.pull_request && issue.title === title);
+            if (existing) {
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: existing.number,
+                title,
+                body,
+                labels: [label],
+                state: "open",
+              });
+            } else {
+              await github.rest.issues.create({ owner, repo, title, body, labels: [label] });
+            }
+
+      - name: Close resolved synchronization failure issue
+        if: always() && steps.fixture.outcome == 'success' && steps.sync.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = "[upstream-sync] Synchronization failed";
+            const { owner, repo } = context.repo;
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: "open",
+              per_page: 100,
+            });
+            for (const issue of issues) {
+              if (!issue.pull_request && issue.title === title) {
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  state: "closed",
+                  state_reason: "completed",
+                });
+              }
+            }
+
+      - name: Fail the workflow after reporting
+        if: always() && (steps.fixture.outcome == 'failure' || steps.sync.outcome == 'failure')
+        run: exit 1

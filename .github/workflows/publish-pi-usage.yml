@@ -1,0 +1,39 @@
+name: Publish pi-usage
+
+on:
+  push:
+    tags:
+      - 'pi-usage-v*'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish trusted pi-usage package
+    runs-on: ubuntu-latest
+    environment: npm-production
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test pi-usage package
+        run: npm test --workspace @schuettc/pi-usage
+
+      - name: Run full workspace check
+        run: npm run check
+
+      - name: Publish pi-usage with provenance
+        run: npm publish --workspace @schuettc/pi-usage --access public --provenance
