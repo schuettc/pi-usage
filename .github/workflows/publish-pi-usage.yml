@@ -69,7 +69,7 @@ jobs:
       - name: Publish pi-usage with provenance
         run: |
           echo 'FAILED_PHASE=npm-publish' >> "$GITHUB_ENV"
-          npm publish --workspace @schuettc/pi-usage --access public --provenance
+          npm publish --workspace @schuettc/pi-usage --access public --tag latest --provenance
 
       - name: Report publication failure
         if: always() && failure()
