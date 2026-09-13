@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { formatUsageStatusline } from "../src/format.js";
+import { formatCodexUsageReport, formatUsageStatusline } from "../src/format.js";
 import { reportMatchesModel } from "../src/models.js";
 import { normalizeAnthropicUsagePayload } from "../src/normalize-anthropic.js";
-import type { AdapterUsageReport, ProviderUsageModel } from "../src/types.js";
+import type { AdapterUsageReport, CodexUsageReport, ProviderUsageModel } from "../src/types.js";
 
 const now = Date.parse("2026-09-12T13:00:00Z");
 const anthropicReport = normalizeAnthropicUsagePayload(
@@ -38,6 +38,31 @@ const financialAnthropicReport = normalizeAnthropicUsagePayload(
   },
   now,
 );
+const nativeCodexReport: CodexUsageReport = {
+  provider: "codex",
+  source: "pi-auth",
+  capturedAt: now,
+  snapshots: [
+    {
+      limitId: "codex",
+      primary: {
+        usedPercent: 88,
+        windowMinutes: 7 * 24 * 60,
+        resetsAt: (now + 6 * 24 * 60 * 60_000) / 1000,
+      },
+    },
+    {
+      limitId: "codex_bengalfox",
+      limitName: "GPT-5.3-Codex-Spark",
+      primary: { usedPercent: 0, windowMinutes: 5 * 60, resetsAt: (now + 4 * 60 * 60_000) / 1000 },
+      secondary: {
+        usedPercent: 8,
+        windowMinutes: 7 * 24 * 60,
+        resetsAt: (now + 6 * 24 * 60 * 60_000) / 1000,
+      },
+    },
+  ],
+};
 const codexAdapterReport: AdapterUsageReport = {
   provider: "codex",
   source: "external-adapter",
@@ -98,6 +123,31 @@ void test("preserves native Anthropic financial status while rendering matched m
   } finally {
     Date.now = originalNow;
   }
+});
+
+void test("labels native Codex windows by reported duration for every model bucket", () => {
+  const originalNow = Date.now;
+  Date.now = () => now;
+  try {
+    assert.equal(
+      formatUsageStatusline(nativeCodexReport, model("openai-codex", "gpt-5.6-sol", "GPT-5.6 Sol")),
+      "Codex · 7d 88% ↻6d",
+    );
+    assert.equal(
+      formatUsageStatusline(nativeCodexReport, model("openai-codex", "gpt-5.3-codex-spark", "GPT-5.3-Codex-Spark")),
+      "Codex spark · 5h 0% ↻4h · 7d 8% ↻6d",
+    );
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+void test("labels detailed native Codex windows by reported duration", () => {
+  const report = formatCodexUsageReport(nativeCodexReport);
+  assert.match(report, / {2}7d limit:\s+\[/);
+  assert.match(report, / {2}GPT-5\.3-Codex-Spark limit:\n {2}5h limit:\s+\[/);
+  assert.match(report, / {2}7d limit:\s+\[/g);
+  assert.doesNotMatch(report, / {2}5h limit:\s+\[[^\n]+88% used/);
 });
 
 void test("renders matching external Codex model windows", () => {

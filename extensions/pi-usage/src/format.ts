@@ -31,8 +31,12 @@ export function formatCodexUsageReport(report: CodexUsageReport, _cacheAgeMs?: n
     if (!isPrimaryCodexSnapshot(snapshot)) {
       lines.push(`  ${label} limit:`);
     }
-    if (snapshot.primary) lines.push(formatWindowLine("5h limit:", snapshot.primary));
-    if (snapshot.secondary) lines.push(formatWindowLine("7d limit:", snapshot.secondary));
+    if (snapshot.primary) {
+      lines.push(formatWindowLine(`${rateLimitWindowLabel(snapshot.primary, "5h")} limit:`, snapshot.primary));
+    }
+    if (snapshot.secondary) {
+      lines.push(formatWindowLine(`${rateLimitWindowLabel(snapshot.secondary, "7d")} limit:`, snapshot.secondary));
+    }
     if (!snapshot.primary && !snapshot.secondary) {
       lines.push("  Limits unavailable for this account");
     }
@@ -56,8 +60,10 @@ export function formatCodexUsageStatusline(report: CodexUsageReport, model?: Pro
   const parts = ["Codex"];
   if (!isPrimaryCodexSnapshot(snapshot))
     parts[0] = `Codex ${compactLimitLabel(snapshot.limitName ?? snapshot.limitId)}`;
-  if (snapshot.primary) parts.push(formatCompactWindow("5h", snapshot.primary));
-  if (snapshot.secondary) parts.push(formatCompactWindow("7d", snapshot.secondary));
+  if (snapshot.primary) parts.push(formatCompactWindow(rateLimitWindowLabel(snapshot.primary, "5h"), snapshot.primary));
+  if (snapshot.secondary) {
+    parts.push(formatCompactWindow(rateLimitWindowLabel(snapshot.secondary, "7d"), snapshot.secondary));
+  }
   if (parts.length === 1 && snapshot.credits) parts.push(formatCredits(snapshot.credits));
   return parts.join(" · ");
 }
@@ -206,6 +212,14 @@ function selectFirstModelScope(windows: NormalizedUsageWindow[]): NormalizedUsag
       window.scope.kind === "model" &&
       window.scope.modelIds.some((modelId) => modelIds.has(normalizedUsageKey(modelId))),
   );
+}
+
+function rateLimitWindowLabel(window: NormalizedRateLimitWindow, fallback: string): string {
+  const minutes = window.windowMinutes;
+  if (minutes === undefined || !Number.isFinite(minutes) || minutes <= 0) return fallback;
+  if (minutes % (24 * 60) === 0) return `${minutes / (24 * 60)}d`;
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${minutes}m`;
 }
 
 function formatCompactWindow(label: string, window: NormalizedRateLimitWindow): string {
