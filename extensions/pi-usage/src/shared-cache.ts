@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname } from "node:path";
-import { flockSync } from "fs-ext-extra-prebuilt";
+import type { flockSync as NativeFlockSync } from "fs-ext-extra-prebuilt";
 import {
   CACHE_TTL_MS,
   RATE_LIMIT_BACKOFF_MAX_MS,
@@ -15,6 +16,29 @@ import type { ProviderUsageModel, SharedCacheEntry, SharedUsageCache, UsageProvi
 const MUTATION_LOCK_RETRY_MS = 5;
 const MUTATION_LOCK_ATTEMPTS = 11;
 const mutationLockWaitArray = new Int32Array(new SharedArrayBuffer(4));
+const require = createRequire(import.meta.url);
+type FlockSync = typeof NativeFlockSync;
+let mutationLockBackend: FlockSync | undefined;
+let mutationLockBackendResolved = false;
+
+/** Resolve the required kernel-lock implementation only when a mutation is
+ * attempted. A missing, incompatible, or damaged native addon disables cache
+ * mutation for this process; reads and the rest of the extension stay usable.
+ */
+function resolveMutationLockBackend(): FlockSync | undefined {
+  if (mutationLockBackendResolved) return mutationLockBackend;
+  mutationLockBackendResolved = true;
+  try {
+    const candidate: unknown = require("fs-ext-extra-prebuilt");
+    if (typeof candidate !== "object" || candidate === null) return undefined;
+    const flockSync = Reflect.get(candidate, "flockSync");
+    if (typeof flockSync !== "function") return undefined;
+    mutationLockBackend = flockSync as FlockSync;
+  } catch {
+    mutationLockBackend = undefined;
+  }
+  return mutationLockBackend;
+}
 
 export type MutationLockPhase = "after-open" | "after-acquire" | "before-cache-replace" | "after-cache-replace";
 
@@ -175,7 +199,7 @@ export function readSharedUsageCache(): SharedUsageCache | undefined {
   }
 }
 
-type MutationLock = { descriptor: number };
+type MutationLock = { descriptor: number; flockSync: FlockSync };
 
 /**
  * The lock path is a permanent rendezvous inode: this module never renames or
@@ -184,6 +208,9 @@ type MutationLock = { descriptor: number };
  * stale-owner metadata, PID liveness decision, or takeover path to race.
  */
 function tryAcquireMutationLock(): MutationLock | undefined {
+  const flockSync = resolveMutationLockBackend();
+  if (!flockSync) return undefined;
+
   try {
     mkdirSync(dirname(runtime.cacheFile), { recursive: true });
   } catch {
@@ -202,7 +229,7 @@ function tryAcquireMutationLock(): MutationLock | undefined {
     try {
       flockSync(descriptor, "exnb");
       runtime.mutationLockPhase?.("after-acquire");
-      return { descriptor };
+      return { descriptor, flockSync };
     } catch {
       if (attempt + 1 >= MUTATION_LOCK_ATTEMPTS) {
         try {
@@ -223,7 +250,7 @@ function verifyMutationLock(lock: MutationLock): boolean {
     // Reasserting LOCK_EX|LOCK_NB on the same open file description is an
     // atomic kernel ownership check. The descriptor remains locked across the
     // following rename, so there is no reusable-path check/use window.
-    flockSync(lock.descriptor, "exnb");
+    lock.flockSync(lock.descriptor, "exnb");
     return true;
   } catch {
     return false;
