@@ -1,6 +1,6 @@
 {
-  "name": "@sreetej510/pi-usage",
-  "version": "0.10.0",
+  "name": "@schuettc/pi-usage",
+  "version": "0.10.0-schuettc.1",
   "description": "Pi extension that reports provider usage/rate-limit budgets (Codex, Anthropic OAuth, etc.) via /usage, with a live statusline widget.",
   "type": "module",
   "license": "MIT",
@@ -28,20 +28,26 @@
     "prepublishOnly": "npm run build",
     "check": "biome check . && npm run typecheck",
     "format": "biome check --write .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.3",
     "@earendil-works/pi-coding-agent": "^0.84.2",
     "@earendil-works/pi-tui": "^0.84.2",
+    "tsx": "4.20.5",
     "typescript": "^5.7.3"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/Sreetej510/pi-extensions",
+    "url": "https://github.com/schuettc/pi-usage",
     "directory": "extensions/pi-usage"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": true
+  },
+  "dependencies": {
+    "fs-ext-extra-prebuilt": "^2.2.14"
   }
 }

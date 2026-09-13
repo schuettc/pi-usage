@@ -1,0 +1,122 @@
+name: Publish pi-usage
+
+on:
+  push:
+    tags:
+      - 'pi-usage-v*'
+
+permissions:
+  contents: read
+  id-token: write
+  issues: write
+
+concurrency:
+  group: publish-pi-usage
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish trusted pi-usage package
+    runs-on: ubuntu-latest
+    environment: npm-production
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Verify release tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          echo 'FAILED_PHASE=tag-validation' >> "$GITHUB_ENV"
+          package_version="$(node -p "require('./extensions/pi-usage/package.json').version")"
+          expected_tag="pi-usage-v${package_version}"
+          if [ "$RELEASE_TAG" != "$expected_tag" ]; then
+            echo "Release tag $RELEASE_TAG does not match package version $package_version (expected $expected_tag)." >&2
+            exit 1
+          fi
+          git fetch --force origin refs/tags/pi-usage-upstream-base:refs/tags/pi-usage-upstream-base
+          echo "NEW_UPSTREAM_COMMIT=$(git rev-parse 'refs/tags/pi-usage-upstream-base^{commit}')" >> "$GITHUB_ENV"
+
+      - name: Mark install phase
+        run: echo 'FAILED_PHASE=install' >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test pi-usage package
+        run: |
+          echo 'FAILED_PHASE=package-test' >> "$GITHUB_ENV"
+          npm test --workspace @schuettc/pi-usage
+
+      - name: Run full workspace check
+        run: |
+          echo 'FAILED_PHASE=workspace-check' >> "$GITHUB_ENV"
+          npm run check
+
+      - name: Verify packed artifact
+        run: |
+          echo 'FAILED_PHASE=artifact-smoke' >> "$GITHUB_ENV"
+          node .github/scripts/verify-pi-usage-pack.mjs
+
+      - name: Publish pi-usage with provenance
+        run: |
+          echo 'FAILED_PHASE=npm-publish' >> "$GITHUB_ENV"
+          npm publish --workspace @schuettc/pi-usage --access public --provenance
+
+      - name: Report publication failure
+        if: always() && failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title='[publish-pi-usage] Publication failed'
+          label='publish-pi-usage'
+          body_file="$(mktemp)"
+          cat > "$body_file" <<EOF
+          The pi-usage trusted publication failed.
+
+          - Run: $RUN_URL
+          - Failed phase: ${FAILED_PHASE:-unavailable}
+          - Old upstream commit: ${OLD_UPSTREAM_COMMIT:-unavailable}
+          - New upstream commit: ${NEW_UPSTREAM_COMMIT:-unavailable}
+
+          Inspect the failed run. A successful rerun closes this issue automatically.
+          EOF
+          gh label create "$label" --color B60205 --description 'Automated pi-usage publication failure' --force
+          match="$(gh issue list --state all --limit 1000 --json number,state,title \
+            --jq 'map(select(.title == "[publish-pi-usage] Publication failed"))[0] | if . == null then "" else "\(.number) \(.state)" end')"
+          if [ -n "$match" ]; then
+            read -r number state <<< "$match"
+            gh issue edit "$number" --title "$title" --body-file "$body_file" --add-label "$label"
+            if [ "$state" = 'CLOSED' ]; then gh issue reopen "$number"; fi
+          else
+            gh issue create --title "$title" --body-file "$body_file" --label "$label"
+          fi
+
+      - name: Close resolved publication failure issue
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = "[publish-pi-usage] Publication failed";
+            const { owner, repo } = context.repo;
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: "open", per_page: 100,
+            });
+            for (const issue of issues) {
+              if (!issue.pull_request && issue.title === title) {
+                await github.rest.issues.update({
+                  owner, repo, issue_number: issue.number, state: "closed", state_reason: "completed",
+                });
+              }
+            }

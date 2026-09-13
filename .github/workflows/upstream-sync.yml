@@ -1,0 +1,126 @@
+name: Synchronize pi-usage with upstream
+
+on:
+  schedule:
+    - cron: '17 8 * * *'
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: Rebuild and publish the current patch stack even when upstream has not moved
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: pi-usage-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  synchronize:
+    name: Rebuild publication branch
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PI_USAGE_SYNC_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Configure upstream remote
+        run: |
+          echo 'FAILED_PHASE=configure-upstream' >> "$GITHUB_ENV"
+          git remote add upstream https://github.com/Sreetej510/pi-extensions.git
+          git fetch --force origin refs/tags/pi-usage-upstream-base:refs/tags/pi-usage-upstream-base
+          git fetch upstream master
+          echo "OLD_UPSTREAM_COMMIT=$(git rev-parse 'refs/tags/pi-usage-upstream-base^{commit}')" >> "$GITHUB_ENV"
+          echo "NEW_UPSTREAM_COMMIT=$(git rev-parse refs/remotes/upstream/master)" >> "$GITHUB_ENV"
+
+      - name: Test synchronization fixture
+        run: |
+          echo 'FAILED_PHASE=fixture-test' >> "$GITHUB_ENV"
+          bash .github/scripts/upstream-sync.sh --fixture-test
+
+      - name: Synchronize upstream
+        env:
+          FORCE_PUBLISH: ${{ inputs.force_publish }}
+        run: |
+          echo 'FAILED_PHASE=synchronize' >> "$GITHUB_ENV"
+          if [ "$FORCE_PUBLISH" = 'true' ]; then
+            bash .github/scripts/upstream-sync.sh --force
+          else
+            bash .github/scripts/upstream-sync.sh
+          fi
+
+      - name: Report synchronization failure
+        if: always() && failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title='[upstream-sync] Synchronization failed'
+          label='upstream-sync'
+          body_file="$(mktemp)"
+          cat > "$body_file" <<EOF
+          The deterministic pi-usage upstream synchronization failed.
+
+          - Run: $RUN_URL
+          - Failed phase: ${FAILED_PHASE:-unavailable}
+          - Old upstream commit: ${OLD_UPSTREAM_COMMIT:-unavailable}
+          - New upstream commit: ${NEW_UPSTREAM_COMMIT:-unavailable}
+
+          Inspect the failed run and resolve the patch-stack or infrastructure error. Later success closes this issue automatically.
+          EOF
+
+          gh label create "$label" \
+            --color B60205 \
+            --description 'Automated upstream synchronization failure' \
+            --force
+          match="$(gh issue list --state all --limit 1000 --json number,state,title \
+            --jq 'map(select(.title == "[upstream-sync] Synchronization failed"))[0] | if . == null then "" else "\(.number) \(.state)" end')"
+          if [ -n "$match" ]; then
+            read -r number state <<< "$match"
+            gh issue edit "$number" --title "$title" --body-file "$body_file" --add-label "$label"
+            if [ "$state" = 'CLOSED' ]; then
+              gh issue reopen "$number"
+            fi
+          else
+            gh issue create --title "$title" --body-file "$body_file" --label "$label"
+          fi
+
+      - name: Close resolved synchronization failure issue
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = "[upstream-sync] Synchronization failed";
+            const { owner, repo } = context.repo;
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: "open",
+              per_page: 100,
+            });
+            for (const issue of issues) {
+              if (!issue.pull_request && issue.title === title) {
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  state: "closed",
+                  state_reason: "completed",
+                });
+              }
+            }

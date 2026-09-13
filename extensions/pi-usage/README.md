@@ -1,4 +1,4 @@
-# @sreetej510/pi-usage
+# @schuettc/pi-usage
 
 A [pi](https://github.com/earendil-works/pi) coding agent extension that reports provider
 usage / rate-limit budgets — OpenAI Codex, Anthropic OAuth, and pi-auth-backed providers — via
@@ -14,6 +14,39 @@ usage / rate-limit budgets — OpenAI Codex, Anthropic OAuth, and pi-auth-backed
   on rate limits (`429`).
 - Shows the next Codex banked-reset expiry and supports confirmed, interactive consumption.
 
+## Provider support
+- OpenAI Codex through Pi auth, with the Codex app-server fallback.
+- Anthropic OAuth through Pi auth.
+- Optional provider adapters discovered at runtime. No Schuettc package is required.
+
+## Optional provider adapter protocol
+
+Adapters and consumers discover the V1 process-local registry through
+`Symbol.for("pi.provider-usage.bus.v1")` (also exported as `PROVIDER_USAGE_BUS_SYMBOL`). An adapter has this structural shape:
+
+```ts
+{
+  id: string;
+  usageProvider: "claude" | "codex";
+  modelProviders: string[];
+  refresh(options: { timeoutMs: number; signal?: AbortSignal }): Promise<ProviderUsageSnapshotV1>;
+}
+```
+
+Snapshots use the exported `ProviderUsageSnapshotV1`, `NormalizedUsageWindow`, `UsageScopeV1`, and
+`UsageStateV1` types. Complete account refreshes replace an adapter/provider snapshot; partial passive
+snapshots merge supplied windows and fields by stable scope/window identity. Unknown utilization is omitted,
+not reported as zero. Malformed, incompatible, absent, or throwing optional registries fail open.
+
+The usage extension owns once-per-provider warning notifications when subscribed. Providers may publish
+`soft-warning` and `hard-limit` events; hard limits are always shown. A provider running without pi-usage must
+keep its own standalone warning policy. Without any optional adapter, pi-usage remains standalone and uses its
+native Codex and Anthropic OAuth queries and cache.
+
+## Shared state
+Snapshots are cached at `~/.pi/agent/usage-cache.json`. The cache contains normalized usage only, never access
+tokens, raw responses, or account identifiers.
+
 ## Commands
 
 | Command | Effect |
@@ -27,14 +60,14 @@ usage / rate-limit budgets — OpenAI Codex, Anthropic OAuth, and pi-auth-backed
 ## Install
 
 ```bash
-npm install -g @sreetej510/pi-usage
+npm install -g @schuettc/pi-usage
 ```
 
 Then add it to your pi `settings.json`:
 
 ```json
 {
-  "packages": ["npm:@sreetej510/pi-usage"]
+  "packages": ["npm:@schuettc/pi-usage"]
 }
 ```
 
@@ -77,6 +110,6 @@ Or, for local development, point at the file directly:
 
 ```bash
 npm install
-npm run --workspace @sreetej510/pi-usage check     # biome + typecheck
-npm run --workspace @sreetej510/pi-usage format
+npm run --workspace @schuettc/pi-usage check     # biome + typecheck
+npm run --workspace @schuettc/pi-usage format
 ```

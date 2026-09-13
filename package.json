@@ -18,7 +18,7 @@
     "check": "npm run biome:check && npm run typecheck && npm run build && npm test",
     "pack:hpc-tools": "npm --workspace @sreetej510/pi-hpc-tools pack --dry-run",
     "pack:prompt-manager": "npm --workspace @sreetej510/pi-prompt-manager pack --dry-run",
-    "pack:usage": "npm --workspace @sreetej510/pi-usage pack --dry-run",
+    "pack:usage": "npm --workspace @schuettc/pi-usage pack --dry-run",
     "pack:shipd-checks": "npm --workspace @sreetej510/pi-shipd-checks pack --dry-run",
     "publish:dry": "npm --workspaces publish --dry-run --access public",
     "publish:github:dry": "npm --workspaces publish --dry-run --access public --registry https://npm.pkg.github.com",
