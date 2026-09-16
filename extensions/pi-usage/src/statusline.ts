@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getUsageAdaptersV1 } from "./adapter-bus.js";
+import { resolveAnthropicAccountEmail } from "./anthropic-account.js";
 import {
   ANTHROPIC_PROVIDER_ID,
   CACHE_TTL_MS,
@@ -8,10 +9,17 @@ import {
   DEFAULT_TIMEOUT_MS,
   REFRESH_LEASE_MS,
   STATUS_KEY,
+  USAGE_UNAVAILABLE_TEXT,
 } from "./constants.js";
 import { isRateLimitErrorMessage, isStaleExtensionContextError, rateLimitBackoffMs } from "./errors.js";
 import { formatUsageStatusline } from "./format.js";
-import { isUsageSupportedModel, providerKeyForModel, reportMatchesModel } from "./models.js";
+import {
+  isAnthropicModel,
+  isOpenAICodexModel,
+  isUsageSupportedModel,
+  providerKeyForModel,
+  reportMatchesModel,
+} from "./models.js";
 import { normalizeExternalUsageSnapshot } from "./normalize-external.js";
 import { queryUsageWithRetries } from "./query.js";
 import {
@@ -41,6 +49,7 @@ type StatuslineRuntime = {
   queryUsage: (ctx: ExtensionContext, options: { timeoutMs: number }) => Promise<QueryUsageResult>;
   setTimeout: (callback: () => void, delayMs: number) => StatuslineTimer;
   clearTimeout: (timer: StatuslineTimer) => void;
+  resolveAccountEmail: () => string | undefined;
 };
 
 const defaultRuntime: StatuslineRuntime = {
@@ -48,6 +57,7 @@ const defaultRuntime: StatuslineRuntime = {
   queryUsage: queryUsageWithRetries,
   setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
   clearTimeout: (timer) => clearTimeout(timer),
+  resolveAccountEmail: resolveAnthropicAccountEmail,
 };
 const refreshLeaseOwner = `${process.pid}:${randomUUID()}`;
 let runtime = defaultRuntime;
@@ -95,7 +105,9 @@ const clearStatuslineTimers = () => {
  * This keeps tests off the real cache/network without changing production use. */
 export function configureStatuslineForTests(overrides: Partial<StatuslineRuntime> = {}): void {
   clearStatuslineTimers();
-  runtime = { ...defaultRuntime, ...overrides };
+  // Tests must be deterministic regardless of the developer's ~/.claude.json, so
+  // the account resolver is off unless a test explicitly overrides it.
+  runtime = { ...defaultRuntime, resolveAccountEmail: () => undefined, ...overrides };
   cache = undefined;
   combinedCache = undefined;
   statuslineRequestId = 0;
@@ -178,7 +190,7 @@ const scheduleCountdownRerender = (
   const rerender = () => {
     statuslineCountdownTimer = undefined;
     if (!sessionActive || requestId !== statuslineRequestId) return;
-    let text = formatUsageStatusline(report, model);
+    let text = renderStatuslineText(report, model);
     if (text === undefined) return;
     if (stale) text = `${text} (${formatAgeShort(Math.max(0, runtime.now() - report.capturedAt))} old)`;
     if (!setStatuslineValue(ctx, text)) return;
@@ -201,7 +213,7 @@ const setUsageStatusline = (
     schedule?: boolean;
   },
 ): boolean => {
-  let text = formatUsageStatusline(report, options.model);
+  let text = renderStatuslineText(report, options.model);
   if (text === undefined) {
     setStatuslineValue(ctx, undefined);
     return false;
@@ -219,6 +231,18 @@ const setUsageStatusline = (
   return true;
 };
 
+/** Prefer a native report (always `complete`) over a broken/partial
+ * external-adapter one, THEN break ties by recency. The bridge's partial 5h
+ * events refresh often, so newest-wins alone would let them shadow the accurate
+ * native OAuth report — this keeps native winning even when it is slightly
+ * older. */
+function isPreferredOver(candidate: CachedReport, current: CachedReport): boolean {
+  const candidateIsExternal = candidate.report.source === "external-adapter";
+  const currentIsExternal = current.report.source === "external-adapter";
+  if (candidateIsExternal !== currentIsExternal) return !candidateIsExternal;
+  return candidate.createdAt > current.createdAt;
+}
+
 const getCachedReportForModel = (model: ProviderUsageModel | undefined, now: number): CachedReport | undefined => {
   try {
     let best = cache && reportMatchesModel(cache.report, model) ? cache : undefined;
@@ -226,7 +250,7 @@ const getCachedReportForModel = (model: ProviderUsageModel | undefined, now: num
       const report = combinedCache.reports.find((item) => reportMatchesModel(item, model));
       if (report) {
         const candidate = { createdAt: combinedCache.createdAt, report };
-        if (!best || candidate.createdAt > best.createdAt) best = candidate;
+        if (!best || isPreferredOver(candidate, best)) best = candidate;
       }
     }
 
@@ -236,14 +260,28 @@ const getCachedReportForModel = (model: ProviderUsageModel | undefined, now: num
     let shared = readFreshReportForModel(model, now);
     for (const entry of Object.values(readSharedUsageCache()?.entries ?? {})) {
       if (!entry?.report || !reportMatchesModel(entry.report, model)) continue;
-      if (!shared || entry.createdAt > shared.createdAt) shared = entry;
+      if (!shared || isPreferredOver(entry, shared)) shared = entry;
     }
-    if (shared && (!best || shared.createdAt > best.createdAt)) best = shared;
+    if (shared && (!best || isPreferredOver(shared, best))) best = shared;
     return best;
   } catch {
     return cache && reportMatchesModel(cache.report, model) ? cache : undefined;
   }
 };
+
+/** Renders the statusline text and, for Anthropic/claude reports, tags it with
+ * the account the usage is charged against. The email is resolved at render
+ * time and NEVER persisted to the cache or report objects. */
+function renderStatuslineText(report: UsageReport, model: ProviderUsageModel | undefined): string | undefined {
+  const text = formatUsageStatusline(report, model);
+  if (text === undefined) return undefined;
+  if (report.provider !== "claude" || text === USAGE_UNAVAILABLE_TEXT) return text;
+  const email = runtime.resolveAccountEmail();
+  if (!email) return text;
+  const match = text.match(/^(\S+)([\s\S]*)$/);
+  if (!match) return text;
+  return `${match[1]}(${email})${match[2]}`;
+}
 
 function clearRefreshTimer(): void {
   if (!statuslineRefreshTimer) return;
@@ -252,7 +290,7 @@ function clearRefreshTimer(): void {
 }
 
 function usageProviderForModel(model: ProviderUsageModel): UsageProviderKey {
-  if (model.provider === ANTHROPIC_PROVIDER_ID || model.provider === CODEX_PROVIDER_ID) {
+  if (isAnthropicModel(model) || isOpenAICodexModel(model)) {
     return providerKeyForModel(model);
   }
   return (

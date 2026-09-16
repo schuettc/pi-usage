@@ -3,8 +3,15 @@ import { join } from "node:path";
 import type { CommandArgumentCompletion } from "./types.js";
 
 export const COMMAND_NAME = "usage";
+/** Sentinel shown when a provider has no usable usage windows. Shared so the
+ * statusline account-tag guard stays coupled to the producer. */
+export const USAGE_UNAVAILABLE_TEXT = "usage unavailable";
 export const CODEX_PROVIDER_ID = "openai-codex";
 export const ANTHROPIC_PROVIDER_ID = "anthropic";
+export const CLAUDE_BRIDGE_PROVIDER_ID = "claude-bridge";
+/** Model providers whose usage is charged against the native Anthropic OAuth
+ * meter. claude-bridge routes through the same OAuth account as `anthropic`. */
+export const ANTHROPIC_MODEL_PROVIDER_IDS = new Set<string>([ANTHROPIC_PROVIDER_ID, CLAUDE_BRIDGE_PROVIDER_ID]);
 export const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 export const CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 export const CODEX_CONSUME_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";

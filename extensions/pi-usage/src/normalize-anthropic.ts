@@ -1,4 +1,4 @@
-import { ANTHROPIC_NON_WINDOW_KEYS } from "./constants.js";
+import { ANTHROPIC_NON_WINDOW_KEYS, USAGE_UNAVAILABLE_TEXT } from "./constants.js";
 import { progressBarUsed } from "./format.js";
 import type {
   AnthropicExtraUsage,
@@ -205,7 +205,7 @@ function formatAnthropicSummary(
       const reset = window.resetsAt ? ` (resets ${formatReset(window.resetsAt)})` : "";
       const utilization =
         window.usedPercent === undefined
-          ? "usage unavailable"
+          ? USAGE_UNAVAILABLE_TEXT
           : `${progressBarUsed(window.usedPercent)} ${window.usedPercent.toFixed(0)}% used`;
       lines.push(
         `  ${window.label}: ${utilization} (${formatCurrencyAmount(usedDollars, "USD")}/${formatCurrencyAmount(limitDollars, "USD")})${reset}`,
@@ -222,7 +222,7 @@ function formatAnthropicSummary(
     lines.push("  Monthly extra usage:");
     const utilization =
       window.usedPercent === undefined
-        ? "usage unavailable"
+        ? USAGE_UNAVAILABLE_TEXT
         : `${progressBarUsed(window.usedPercent)} ${window.usedPercent.toFixed(0)}% used`;
     lines.push(`  ${utilization} ${amount}${reset}`);
   }
@@ -300,7 +300,7 @@ function formatRollingWindow(window: NormalizedUsageWindow): string {
   const reset = window.resetsAt ? ` (resets ${formatReset(window.resetsAt, window.label !== "5h")})` : "";
   const utilization =
     window.usedPercent === undefined
-      ? "usage unavailable"
+      ? USAGE_UNAVAILABLE_TEXT
       : `${progressBarUsed(window.usedPercent)} ${window.usedPercent.toFixed(0)}% used`;
   return `${window.label}: ${utilization}${reset}`;
 }

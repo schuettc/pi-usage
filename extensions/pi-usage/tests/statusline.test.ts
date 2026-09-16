@@ -17,6 +17,7 @@ import {
   applyProviderUsageSnapshot,
   configureStatuslineForTests,
   refreshCurrentUsageStatusline,
+  setCombinedCache,
   setSessionActive,
 } from "../src/statusline.js";
 import type {
@@ -701,6 +702,88 @@ void test("a partial bridge snapshot merges by stable window identity and retain
           { id: "extra_usage", usedPercent: 8, state: undefined },
         ],
       );
+    } finally {
+      unregister();
+    }
+  });
+});
+
+void test("a native claude report beats a newer external-adapter report for a claude-bridge model", async () => {
+  await withHarness(async ({ setQuery }) => {
+    let queryCalls = 0;
+    setQuery(async () => {
+      queryCalls += 1;
+      return { ok: true, report: codexReport() };
+    });
+    const model = { provider: "claude-bridge", id: "claude-sonnet", name: "Claude Sonnet" };
+    const native: AnthropicUsageReport = {
+      provider: "claude",
+      source: "anthropic-oauth",
+      capturedAt: NOW - 1_000,
+      windows: [
+        { id: "five_hour", label: "5h", usedPercent: 8, windowMinutes: 300, scope: { kind: "account" } },
+        { id: "seven_day", label: "7d", usedPercent: 7, windowMinutes: 7 * 24 * 60, scope: { kind: "account" } },
+      ],
+      summaryLines: ["Anthropic usage"],
+      statusline: "claude 8% 5h",
+    };
+    // The native report is OLDER; the (broken) external-adapter report is NEWER.
+    // Newest-wins alone would pick the external one, so this guards the
+    // native-over-external precedence.
+    saveSharedUsageReport(native, NOW - 1_000, "claude");
+    setCombinedCache({
+      createdAt: NOW,
+      reports: [
+        {
+          provider: "claude",
+          source: "external-adapter",
+          snapshotSource: "claude-code-rate-limit-event",
+          complete: true,
+          modelProviders: ["claude-bridge", "anthropic"],
+          capturedAt: NOW,
+          windows: [{ id: "five_hour", label: "5h", usedPercent: 99, scope: { kind: "account" } }],
+        },
+      ],
+    });
+    const statuses: Array<string | undefined> = [];
+
+    await refreshCurrentUsageStatusline(context(model, statuses), model);
+
+    assert.equal(queryCalls, 0);
+    assert.equal(statuses.at(-1), "Claude · 5h 8% · 7d 7%");
+  });
+});
+
+void test("the statusline tags the claude provider with the resolved account email", async () => {
+  await withHarness(async () => {
+    configureStatuslineForTests({
+      now: () => NOW,
+      resolveAccountEmail: () => "court@subaud.io",
+      setTimeout: () => ({ unref: () => {} }) as unknown as ReturnType<typeof setTimeout>,
+      clearTimeout: () => {},
+    });
+    setSessionActive(true);
+    const model = { provider: "claude-bridge", id: "claude-sonnet", name: "Claude Sonnet" };
+    const snapshot: ProviderUsageSnapshotV1 = {
+      version: 1,
+      provider: "claude",
+      source: "test-adapter",
+      capturedAt: NOW,
+      complete: true,
+      windows: [{ id: "five_hour", label: "5h", usedPercent: 64, scope: { kind: "account" } }],
+    };
+    const unregister = getUsageBusV1().register({
+      id: "claude-bridge",
+      usageProvider: "claude",
+      modelProviders: ["claude-bridge"],
+      refresh: async () => snapshot,
+    });
+    const statuses: Array<string | undefined> = [];
+    const ctx = context(model, statuses);
+
+    try {
+      assert.equal(applyProviderUsageSnapshot(ctx, snapshot), true);
+      assert.equal(statuses.at(-1), "Claude(court@subaud.io) · 5h 64%");
     } finally {
       unregister();
     }

@@ -4,7 +4,11 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getUsageBusV1 } from "../src/adapter-bus.js";
 import { isUsageSupportedModel } from "../src/models.js";
 import { queryUsage } from "../src/query.js";
-import { applyCurrentProviderStatusline, clearUsageStatusline } from "../src/statusline.js";
+import {
+  applyCurrentProviderStatusline,
+  clearUsageStatusline,
+  configureStatuslineForTests,
+} from "../src/statusline.js";
 import type {
   ProviderUsageAdapterV1,
   ProviderUsageBusV1,
@@ -217,19 +221,42 @@ void test("supports and queries a non-native model through its adapter", async (
   });
 });
 
-void test("keeps a successful claude-bridge adapter report selected in the statusline", async () => {
+void test("routes a claude-bridge model to the native Anthropic OAuth meter instead of the adapter", async () => {
   await withCleanBus(async () => {
+    let adapterRefreshCalls = 0;
     getUsageBusV1().register(
       adapter(
         "claude-bridge-adapter",
         ["claude-bridge"],
-        async () => ({
-          ...usageSnapshot(64),
-          provider: "claude",
-        }),
+        async () => {
+          adapterRefreshCalls += 1;
+          return { ...usageSnapshot(64), provider: "claude" };
+        },
         "claude",
       ),
     );
+    const ctx = {
+      model: { provider: "claude-bridge", id: "claude-sonnet", name: "Claude Sonnet" },
+    } as unknown as ExtensionContext;
+
+    const result = await queryUsage(ctx, { timeoutMs: 4321 });
+
+    // claude-bridge is now Anthropic-backed, so queryUsage drives the native
+    // OAuth meter (queryAnthropicUsage) and never falls back to the bridge
+    // adapter. Without Anthropic auth in this harness the native query fails,
+    // proving the adapter path is no longer taken.
+    assert.equal(adapterRefreshCalls, 0);
+    assert.equal(result.ok, false);
+    if (result.ok) return;
+    assert.equal(result.errors[0]?.source, "anthropic-oauth");
+  });
+});
+
+void test("renders a claude-bridge adapter report through the statusline when applied directly", async () => {
+  await withCleanBus(async () => {
+    // Reset statusline runtime so the account tag stays off regardless of the
+    // developer's ~/.claude.json.
+    configureStatuslineForTests();
     const statuses: Array<string | undefined> = [];
     const ctx = {
       model: { provider: "claude-bridge", id: "claude-sonnet", name: "Claude Sonnet" },
@@ -237,32 +264,22 @@ void test("keeps a successful claude-bridge adapter report selected in the statu
         setStatus: (_key: string, value: string | undefined) => statuses.push(value),
       },
     } as unknown as ExtensionContext;
-
-    const result = await queryUsage(ctx, { timeoutMs: 4321 });
-    assert.equal(result.ok, true);
-    if (!result.ok) return;
-
-    assert.deepEqual(result.report, {
-      provider: "claude",
-      source: "external-adapter",
+    const report = {
+      provider: "claude" as const,
+      source: "external-adapter" as const,
       snapshotSource: "test-adapter",
       adapterId: "claude-bridge-adapter",
       complete: true,
       modelProviders: ["claude-bridge"],
       capturedAt: Date.parse("2026-09-12T13:00:00Z"),
-      windows: [
-        {
-          id: "gpt:five_hour",
-          label: "5h",
-          usedPercent: 64,
-          scope: { kind: "account" },
-        },
-      ],
-    });
-    assert.equal(applyCurrentProviderStatusline(ctx, [result.report]), true);
+      windows: [{ id: "gpt:five_hour", label: "5h", usedPercent: 64, scope: { kind: "account" as const } }],
+    };
+
+    assert.equal(applyCurrentProviderStatusline(ctx, [report]), true);
     assert.deepEqual(statuses, ["Claude · 5h 64%"]);
 
     clearUsageStatusline(ctx);
+    configureStatuslineForTests();
   });
 });
 

@@ -1,5 +1,6 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { BAR_SEGMENTS, LIMIT_VALUE_COLUMN, RESET_FOREGROUND } from "./constants.js";
+import { resolveAnthropicAccountEmail } from "./anthropic-account.js";
+import { BAR_SEGMENTS, LIMIT_VALUE_COLUMN, RESET_FOREGROUND, USAGE_UNAVAILABLE_TEXT } from "./constants.js";
 import { isOpenAICodexModel, reportMatchesModel } from "./models.js";
 import type {
   AdapterUsageReport,
@@ -55,7 +56,7 @@ export function formatCodexUsageReport(report: CodexUsageReport, _cacheAgeMs?: n
 
 export function formatCodexUsageStatusline(report: CodexUsageReport, model?: ProviderUsageModel): string {
   const snapshot = selectSnapshotForUsageModel(report, model);
-  if (!snapshot) return "usage unavailable";
+  if (!snapshot) return USAGE_UNAVAILABLE_TEXT;
 
   const parts = ["Codex"];
   if (!isPrimaryCodexSnapshot(snapshot))
@@ -90,10 +91,29 @@ export function formatUsageStatusline(report: UsageReport, model?: ProviderUsage
   return formatCodexUsageStatusline(report, model);
 }
 
-export function formatUsageReport(report: UsageReport, cacheAgeMs?: number): string {
+export function formatUsageReport(
+  report: UsageReport,
+  cacheAgeMs?: number,
+  emailResolver: () => string | undefined = resolveAnthropicAccountEmail,
+): string {
   if (report.source === "external-adapter") return formatAdapterUsageReport(report);
-  if (report.provider === "claude") return report.summaryLines.join("\n");
+  if (report.provider === "claude") return formatAnthropicSummaryWithAccount(report.summaryLines, emailResolver);
   return formatCodexUsageReport(report, cacheAgeMs);
+}
+
+/** Appends the charged-against account email to the Anthropic header at DISPLAY
+ * time. The email is resolved here (never persisted to the cached report). The
+ * resolver is injectable so this path is deterministically testable. */
+function formatAnthropicSummaryWithAccount(
+  summaryLines: string[],
+  emailResolver: () => string | undefined = resolveAnthropicAccountEmail,
+): string {
+  const email = emailResolver();
+  if (!email) return summaryLines.join("\n");
+  const lines = [...summaryLines];
+  const headerIndex = lines.findIndex((line) => line.includes(">_ Anthropic Usage"));
+  if (headerIndex >= 0) lines[headerIndex] = `${lines[headerIndex]} (${email})`;
+  return lines.join("\n");
 }
 
 function formatNormalizedUsageStatusline(
@@ -118,7 +138,7 @@ function formatNormalizedUsageStatusline(
     (window) => window.scope.kind === "overage" || window.scope.kind === "provider",
   );
   const selectedWindows = [...accountWindows, ...modelWindows, ...overageWindows];
-  if (selectedWindows.length === 0) return "usage unavailable";
+  if (selectedWindows.length === 0) return USAGE_UNAVAILABLE_TEXT;
 
   const modelScopeCounts = new Map<string, number>();
   for (const window of modelWindows) {
@@ -371,7 +391,7 @@ function formatWindowLine(label: string, window: NormalizedRateLimitWindow): str
 function formatNormalizedWindowLine(label: string, window: NormalizedUsageWindow): string {
   const utilization =
     window.usedPercent === undefined
-      ? "usage unavailable"
+      ? USAGE_UNAVAILABLE_TEXT
       : `${progressBarUsed(window.usedPercent)} ${clampPercent(window.usedPercent).toFixed(0)}% used`;
   const reset = window.resetsAt ? ` (resets ${formatReset(window.resetsAt)})` : "";
   const amount =

@@ -1,5 +1,5 @@
 import { getUsageAdaptersV1 } from "./adapter-bus.js";
-import { ANTHROPIC_PROVIDER_ID, CODEX_PROVIDER_ID } from "./constants.js";
+import { ANTHROPIC_MODEL_PROVIDER_IDS, ANTHROPIC_PROVIDER_ID, CODEX_PROVIDER_ID } from "./constants.js";
 import type { PiModel, UsageReport } from "./types.js";
 
 export function isOpenAICodexModel(model: Pick<PiModel, "provider"> | undefined): boolean {
@@ -7,7 +7,7 @@ export function isOpenAICodexModel(model: Pick<PiModel, "provider"> | undefined)
 }
 
 export function isAnthropicModel(model: Pick<PiModel, "provider"> | undefined): boolean {
-  return model?.provider === ANTHROPIC_PROVIDER_ID;
+  return !!model && ANTHROPIC_MODEL_PROVIDER_IDS.has(model.provider);
 }
 
 export function isUsageSupportedModel(model: Pick<PiModel, "provider"> | undefined): boolean {
@@ -58,11 +58,18 @@ export function filterReportsForConfiguredProviders(ctx: AuthCandidateContext, r
 }
 
 function providerAuthCandidateModels(ctx: AuthCandidateContext, providerId: string): PiModel[] {
+  // The anthropic native OAuth meter also covers claude-bridge models, so its
+  // auth candidates include any Anthropic-backed provider (not just an exact
+  // match). The codex path stays exact-match.
+  const accepts =
+    providerId === ANTHROPIC_PROVIDER_ID
+      ? (provider: string) => ANTHROPIC_MODEL_PROVIDER_IDS.has(provider)
+      : (provider: string) => provider === providerId;
   const available = ctx.modelRegistry.getAvailable();
   const candidates: PiModel[] = [];
   const seen = new Set<string>();
   const add = (model: PiModel | undefined) => {
-    if (!model || model.provider !== providerId) return;
+    if (!model || !accepts(model.provider)) return;
     const key = `${model.provider}/${model.id}`;
     if (seen.has(key)) return;
     seen.add(key);

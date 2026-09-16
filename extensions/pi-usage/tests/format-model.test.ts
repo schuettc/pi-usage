@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { formatCodexUsageReport, formatUsageStatusline } from "../src/format.js";
+import { formatCodexUsageReport, formatUsageReport, formatUsageStatusline } from "../src/format.js";
 import { reportMatchesModel } from "../src/models.js";
 import { normalizeAnthropicUsagePayload } from "../src/normalize-anthropic.js";
 import type { AdapterUsageReport, CodexUsageReport, ProviderUsageModel } from "../src/types.js";
@@ -181,4 +181,18 @@ void test("does not render a report for an unsupported or different provider", (
   assert.equal(formatUsageStatusline(anthropicReport, unsupportedModel), undefined);
   assert.equal(formatUsageStatusline(codexAdapterReport, unsupportedModel), undefined);
   assert.equal(reportMatchesModel(codexAdapterReport, unsupportedModel), false);
+});
+
+test("formatUsageReport tags the Anthropic header with the injected account email", () => {
+  const withEmail = formatUsageReport(anthropicReport, undefined, () => "court@subaud.io");
+  const header = withEmail.split("\n").find((line) => line.includes(">_ Anthropic Usage"));
+  assert.ok(header, "expected an Anthropic Usage header line");
+  assert.match(header as string, /\(court@subaud\.io\)/);
+});
+
+test("formatUsageReport omits the account tag when no email resolves", () => {
+  const withoutEmail = formatUsageReport(anthropicReport, undefined, () => undefined);
+  const header = withoutEmail.split("\n").find((line) => line.includes(">_ Anthropic Usage"));
+  assert.ok(header, "expected an Anthropic Usage header line");
+  assert.doesNotMatch(header as string, /\(/);
 });
