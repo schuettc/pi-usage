@@ -221,42 +221,22 @@ void test("supports and queries a non-native model through its adapter", async (
   });
 });
 
-void test("routes a claude-bridge model to the native Anthropic OAuth meter instead of the adapter", async () => {
-  await withCleanBus(async () => {
-    let adapterRefreshCalls = 0;
-    getUsageBusV1().register(
-      adapter(
-        "claude-bridge-adapter",
-        ["claude-bridge"],
-        async () => {
-          adapterRefreshCalls += 1;
-          return { ...usageSnapshot(64), provider: "claude" };
-        },
-        "claude",
-      ),
-    );
-    const ctx = {
-      model: { provider: "claude-bridge", id: "claude-sonnet", name: "Claude Sonnet" },
-    } as unknown as ExtensionContext;
-
-    const result = await queryUsage(ctx, { timeoutMs: 4321 });
-
-    // claude-bridge is now Anthropic-backed, so queryUsage drives the native
-    // OAuth meter (queryAnthropicUsage) and never falls back to the bridge
-    // adapter. Without Anthropic auth in this harness the native query fails,
-    // proving the adapter path is no longer taken.
-    assert.equal(adapterRefreshCalls, 0);
-    assert.equal(result.ok, false);
-    if (result.ok) return;
-    assert.equal(result.errors[0]?.source, "anthropic-oauth");
-  });
-});
-
-void test("renders a claude-bridge adapter report through the statusline when applied directly", async () => {
+void test("keeps a successful claude-bridge adapter report selected in the statusline", async () => {
   await withCleanBus(async () => {
     // Reset statusline runtime so the account tag stays off regardless of the
     // developer's ~/.claude.json.
     configureStatuslineForTests();
+    getUsageBusV1().register(
+      adapter(
+        "claude-bridge-adapter",
+        ["claude-bridge"],
+        async () => ({
+          ...usageSnapshot(64),
+          provider: "claude",
+        }),
+        "claude",
+      ),
+    );
     const statuses: Array<string | undefined> = [];
     const ctx = {
       model: { provider: "claude-bridge", id: "claude-sonnet", name: "Claude Sonnet" },
@@ -264,18 +244,32 @@ void test("renders a claude-bridge adapter report through the statusline when ap
         setStatus: (_key: string, value: string | undefined) => statuses.push(value),
       },
     } as unknown as ExtensionContext;
-    const report = {
-      provider: "claude" as const,
-      source: "external-adapter" as const,
+
+    // claude-bridge is NOT Anthropic-backed, so queryUsage drives the bridge
+    // adapter and returns its external-adapter report (the bridge's inline
+    // usage), never the native OAuth meter.
+    const result = await queryUsage(ctx, { timeoutMs: 4321 });
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+
+    assert.deepEqual(result.report, {
+      provider: "claude",
+      source: "external-adapter",
       snapshotSource: "test-adapter",
       adapterId: "claude-bridge-adapter",
       complete: true,
       modelProviders: ["claude-bridge"],
       capturedAt: Date.parse("2026-09-12T13:00:00Z"),
-      windows: [{ id: "gpt:five_hour", label: "5h", usedPercent: 64, scope: { kind: "account" as const } }],
-    };
-
-    assert.equal(applyCurrentProviderStatusline(ctx, [report]), true);
+      windows: [
+        {
+          id: "gpt:five_hour",
+          label: "5h",
+          usedPercent: 64,
+          scope: { kind: "account" },
+        },
+      ],
+    });
+    assert.equal(applyCurrentProviderStatusline(ctx, [result.report]), true);
     assert.deepEqual(statuses, ["Claude · 5h 64%"]);
 
     clearUsageStatusline(ctx);

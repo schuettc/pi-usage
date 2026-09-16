@@ -708,14 +708,14 @@ void test("a partial bridge snapshot merges by stable window identity and retain
   });
 });
 
-void test("a native claude report beats a newer external-adapter report for a claude-bridge model", async () => {
+void test("a native claude report beats a newer external-adapter report for an anthropic model", async () => {
   await withHarness(async ({ setQuery }) => {
     let queryCalls = 0;
     setQuery(async () => {
       queryCalls += 1;
       return { ok: true, report: codexReport() };
     });
-    const model = { provider: "claude-bridge", id: "claude-sonnet", name: "Claude Sonnet" };
+    const model = { provider: "anthropic", id: "claude-sonnet", name: "Claude Sonnet" };
     const native: AnthropicUsageReport = {
       provider: "claude",
       source: "anthropic-oauth",
