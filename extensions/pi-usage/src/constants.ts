@@ -3,6 +3,9 @@ import { join } from "node:path";
 import type { CommandArgumentCompletion } from "./types.js";
 
 export const COMMAND_NAME = "usage";
+/** Sentinel shown when a provider has no usable usage windows. Shared so the
+ * statusline account-tag guard stays coupled to the producer. */
+export const USAGE_UNAVAILABLE_TEXT = "usage unavailable";
 export const CODEX_PROVIDER_ID = "openai-codex";
 export const ANTHROPIC_PROVIDER_ID = "anthropic";
 export const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
@@ -12,6 +15,7 @@ export const CODEX_OPENAI_BETA = "codex-1";
 export const ANTHROPIC_OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 export const DEFAULT_TIMEOUT_MS = 15_000;
 export const CACHE_TTL_MS = 3 * 60 * 1000;
+export const REFRESH_LEASE_MS = 30_000;
 export const STATUSLINE_RETRY_ATTEMPTS = 3;
 export const STATUSLINE_RETRY_DELAY_MS = 1_000;
 /** Default backoff after a 429 when the server doesn't say when to retry. */
@@ -21,7 +25,7 @@ export const RATE_LIMIT_BACKOFF_MIN_MS = 30 * 1000;
 export const RATE_LIMIT_BACKOFF_MAX_MS = 60 * 60 * 1000;
 /** Shared on-disk usage cache so concurrent pi sessions don't each hit the APIs. */
 export const SHARED_CACHE_FILE = join(homedir(), ".pi", "agent", "usage-cache.json");
-export const SHARED_CACHE_VERSION = 1;
+export const SHARED_CACHE_VERSION = 2;
 export const STATUS_KEY = "provider-usage";
 export const BAR_SEGMENTS = 20;
 export const LIMIT_VALUE_COLUMN = 29;
@@ -31,7 +35,7 @@ export const RESET_FOREGROUND = "\x1b[39m";
  * looks like a `{ used_dollars, limit_dollars }` object is treated as one —
  * Anthropic uses rotating codenames (cinder_cove, amber_ladder, …) so we
  * detect windows by shape instead of a hardcoded key list. */
-export const ANTHROPIC_NON_WINDOW_KEYS = new Set(["five_hour", "seven_day", "extra_usage"]);
+export const ANTHROPIC_NON_WINDOW_KEYS = new Set(["five_hour", "seven_day", "extra_usage", "model_scoped"]);
 
 export const COMMAND_COMPLETIONS: readonly CommandArgumentCompletion[] = [
   { value: "--refresh", label: "--refresh", description: "Refresh usage instead of cached data" },

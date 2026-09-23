@@ -1,11 +1,14 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { BAR_SEGMENTS, LIMIT_VALUE_COLUMN, RESET_FOREGROUND } from "./constants.js";
+import { resolveAnthropicAccountEmail } from "./anthropic-account.js";
+import { BAR_SEGMENTS, LIMIT_VALUE_COLUMN, RESET_FOREGROUND, USAGE_UNAVAILABLE_TEXT } from "./constants.js";
 import { isOpenAICodexModel, reportMatchesModel } from "./models.js";
 import type {
+  AdapterUsageReport,
   CodexUsageReport,
   NormalizedCredits,
   NormalizedRateLimitSnapshot,
   NormalizedRateLimitWindow,
+  NormalizedUsageWindow,
   PiModel,
   ProviderUsageModel,
   UsageQueryError,
@@ -29,8 +32,12 @@ export function formatCodexUsageReport(report: CodexUsageReport, _cacheAgeMs?: n
     if (!isPrimaryCodexSnapshot(snapshot)) {
       lines.push(`  ${label} limit:`);
     }
-    if (snapshot.primary) lines.push(formatWindowLine("5h limit:", snapshot.primary));
-    if (snapshot.secondary) lines.push(formatWindowLine("7d limit:", snapshot.secondary));
+    if (snapshot.primary) {
+      lines.push(formatWindowLine(`${rateLimitWindowLabel(snapshot.primary, "5h")} limit:`, snapshot.primary));
+    }
+    if (snapshot.secondary) {
+      lines.push(formatWindowLine(`${rateLimitWindowLabel(snapshot.secondary, "7d")} limit:`, snapshot.secondary));
+    }
     if (!snapshot.primary && !snapshot.secondary) {
       lines.push("  Limits unavailable for this account");
     }
@@ -49,21 +56,208 @@ export function formatCodexUsageReport(report: CodexUsageReport, _cacheAgeMs?: n
 
 export function formatCodexUsageStatusline(report: CodexUsageReport, model?: ProviderUsageModel): string {
   const snapshot = selectSnapshotForUsageModel(report, model);
-  if (!snapshot) return "usage unavailable";
+  if (!snapshot) return USAGE_UNAVAILABLE_TEXT;
 
-  const parts = [formatStatuslinePrefix(snapshot)];
-  if (snapshot.primary) parts.push(`${clampPercent(snapshot.primary.usedPercent).toFixed(0)}% 5h`);
-  if (snapshot.secondary) parts.push(`${clampPercent(snapshot.secondary.usedPercent).toFixed(0)}% 7d`);
+  const parts = ["Codex"];
+  if (!isPrimaryCodexSnapshot(snapshot))
+    parts[0] = `Codex ${compactLimitLabel(snapshot.limitName ?? snapshot.limitId)}`;
+  if (snapshot.primary) parts.push(formatCompactWindow(rateLimitWindowLabel(snapshot.primary, "5h"), snapshot.primary));
+  if (snapshot.secondary) {
+    parts.push(formatCompactWindow(rateLimitWindowLabel(snapshot.secondary, "7d"), snapshot.secondary));
+  }
   if (parts.length === 1 && snapshot.credits) parts.push(formatCredits(snapshot.credits));
-  return parts.join(" ");
+  return parts.join(" · ");
 }
 
-export function formatUsageStatusline(report: UsageReport, model?: ProviderUsageModel): string {
-  return report.provider === "anthropic" ? report.statusline : formatCodexUsageStatusline(report, model);
+export function formatUsageStatusline(report: UsageReport, model?: ProviderUsageModel): string | undefined {
+  if (model && !reportMatchesModel(report, model)) return undefined;
+  if (report.source === "external-adapter") {
+    return formatNormalizedUsageStatusline(report.windows, report.provider, model, report.providerLabel);
+  }
+  if (report.provider === "claude") {
+    if (!model) return report.statusline;
+    const hasMatchingModelWindows = report.windows.some(
+      (window) =>
+        isUsableNormalizedWindow(window) &&
+        window.scope.kind === "model" &&
+        modelScopeMatchesUsageModel(window.scope.modelIds, model),
+    );
+    const hasFinancialAccountWindows = report.windows.some(
+      (window) => window.scope.kind === "account" && window.windowMinutes === undefined,
+    );
+    if (!hasMatchingModelWindows && hasFinancialAccountWindows) return report.statusline;
+    return formatNormalizedUsageStatusline(report.windows, report.provider, model);
+  }
+  return formatCodexUsageStatusline(report, model);
 }
 
-export function formatUsageReport(report: UsageReport, cacheAgeMs?: number): string {
-  return report.provider === "anthropic" ? report.summaryLines.join("\n") : formatCodexUsageReport(report, cacheAgeMs);
+export function formatUsageReport(
+  report: UsageReport,
+  cacheAgeMs?: number,
+  emailResolver: () => string | undefined = resolveAnthropicAccountEmail,
+): string {
+  if (report.source === "external-adapter") return formatAdapterUsageReport(report);
+  if (report.provider === "claude") return formatAnthropicSummaryWithAccount(report.summaryLines, emailResolver);
+  return formatCodexUsageReport(report, cacheAgeMs);
+}
+
+/** Appends the charged-against account email to the Anthropic header at DISPLAY
+ * time. The email is resolved here (never persisted to the cached report). The
+ * resolver is injectable so this path is deterministically testable. */
+function formatAnthropicSummaryWithAccount(
+  summaryLines: string[],
+  emailResolver: () => string | undefined = resolveAnthropicAccountEmail,
+): string {
+  const email = emailResolver();
+  if (!email) return summaryLines.join("\n");
+  const lines = [...summaryLines];
+  const headerIndex = lines.findIndex((line) => line.includes(">_ Anthropic Usage"));
+  if (headerIndex >= 0) lines[headerIndex] = `${lines[headerIndex]} (${email})`;
+  return lines.join("\n");
+}
+
+function formatNormalizedUsageStatusline(
+  windows: NormalizedUsageWindow[],
+  provider: UsageReport["provider"],
+  model: ProviderUsageModel | undefined,
+  providerLabel?: string,
+): string {
+  const usableWindows = windows.filter(isUsableNormalizedWindow);
+  const modelWindows = model
+    ? usableWindows.filter(
+        (window) => window.scope.kind === "model" && modelScopeMatchesUsageModel(window.scope.modelIds, model),
+      )
+    : selectFirstModelScope(usableWindows);
+  const shadowedDurations = new Set(
+    modelWindows.map((window) => window.windowMinutes).filter((minutes): minutes is number => minutes !== undefined),
+  );
+  const accountWindows = usableWindows.filter(
+    (window) => window.scope.kind === "account" && !shadowedDurations.has(window.windowMinutes ?? -1),
+  );
+  const overageWindows = usableWindows.filter(
+    (window) => window.scope.kind === "overage" || window.scope.kind === "provider",
+  );
+  const selectedWindows = [...accountWindows, ...modelWindows, ...overageWindows];
+  if (selectedWindows.length === 0) return USAGE_UNAVAILABLE_TEXT;
+
+  const modelScopeCounts = new Map<string, number>();
+  for (const window of modelWindows) {
+    if (window.scope.kind !== "model") continue;
+    modelScopeCounts.set(window.scope.label, (modelScopeCounts.get(window.scope.label) ?? 0) + 1);
+  }
+  const parts = selectedWindows.map((window) => {
+    let label = window.label;
+    if (window.scope.kind === "model" && provider === "claude") {
+      label =
+        (modelScopeCounts.get(window.scope.label) ?? 0) > 1
+          ? `${window.scope.label} ${window.label}`
+          : window.scope.label;
+    } else if (window.scope.kind === "provider") {
+      label = window.scope.label ?? window.label;
+    }
+    const percent = window.usedPercent === undefined ? "" : ` ${clampPercent(window.usedPercent).toFixed(0)}%`;
+    const reset = formatResetCountdown(window.resetsAt);
+    return `${label}${percent}${reset ? ` ↻${reset}` : ""}`;
+  });
+  return [providerLabel ?? (provider === "claude" ? "Claude" : "Codex"), ...parts].join(" · ");
+}
+
+function formatAdapterUsageReport(report: AdapterUsageReport): string {
+  const providerLabel = report.providerLabel ?? (report.provider === "claude" ? "Claude" : "OpenAI Codex");
+  const lines = [`  >_ ${providerLabel} Usage`, ""];
+  const usableWindows = report.windows.filter(isUsableNormalizedWindow);
+  if (usableWindows.length === 0) {
+    lines.push("  Usage unavailable");
+    return lines.join("\n");
+  }
+
+  const groups = new Map<string, { label: string; windows: NormalizedUsageWindow[] }>();
+  for (const window of usableWindows) {
+    const key =
+      window.scope.kind === "account"
+        ? "account"
+        : window.scope.kind === "model"
+          ? `model:${JSON.stringify(window.scope.modelIds)}`
+          : window.scope.kind === "overage"
+            ? "overage"
+            : `provider:${window.scope.id}`;
+    const label =
+      window.scope.kind === "account"
+        ? "Account"
+        : window.scope.kind === "model"
+          ? window.scope.label
+          : window.scope.kind === "overage"
+            ? "Overage"
+            : (window.scope.label ?? window.scope.id);
+    const group = groups.get(key) ?? { label, windows: [] };
+    group.windows.push(window);
+    groups.set(key, group);
+  }
+
+  let first = true;
+  for (const group of groups.values()) {
+    if (!first) lines.push("");
+    first = false;
+    lines.push(`  ${group.label} usage:`);
+    for (const window of group.windows) {
+      lines.push(formatNormalizedWindowLine(`${window.label}:`, window));
+    }
+  }
+  return lines.join("\n");
+}
+
+function isUsableNormalizedWindow(window: NormalizedUsageWindow): boolean {
+  return (
+    Boolean(window.label.trim()) &&
+    (window.usedPercent !== undefined || window.resetsAt !== undefined || window.usedAmount !== undefined)
+  );
+}
+
+function modelScopeMatchesUsageModel(modelIds: string[], model: ProviderUsageModel): boolean {
+  const modelKeys = new Set(
+    [normalizedUsageKey(model.id), normalizedUsageKey(model.name)].filter((key): key is string => key !== undefined),
+  );
+  return modelIds.some((modelId) => {
+    const key = normalizedUsageKey(modelId);
+    return key !== undefined && modelKeys.has(key);
+  });
+}
+
+function selectFirstModelScope(windows: NormalizedUsageWindow[]): NormalizedUsageWindow[] {
+  const first = windows.find((window) => window.scope.kind === "model");
+  if (first?.scope.kind !== "model") return [];
+  const modelIds = new Set(first.scope.modelIds.map((modelId) => normalizedUsageKey(modelId)));
+  return windows.filter(
+    (window) =>
+      window.scope.kind === "model" &&
+      window.scope.modelIds.some((modelId) => modelIds.has(normalizedUsageKey(modelId))),
+  );
+}
+
+function rateLimitWindowLabel(window: NormalizedRateLimitWindow, fallback: string): string {
+  const minutes = window.windowMinutes;
+  if (minutes === undefined || !Number.isFinite(minutes) || minutes <= 0) return fallback;
+  if (minutes % (24 * 60) === 0) return `${minutes / (24 * 60)}d`;
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${minutes}m`;
+}
+
+function formatCompactWindow(label: string, window: NormalizedRateLimitWindow): string {
+  const reset = formatResetCountdown(window.resetsAt);
+  return `${label} ${clampPercent(window.usedPercent).toFixed(0)}%${reset ? ` ↻${reset}` : ""}`;
+}
+
+function formatResetCountdown(resetsAt: number | undefined): string | undefined {
+  if (resetsAt === undefined || !Number.isFinite(resetsAt)) return undefined;
+  const remainingMilliseconds = resetsAt * 1000 - Date.now();
+  if (remainingMilliseconds <= 0) return undefined;
+  const remainingMinutes = Math.floor(remainingMilliseconds / 60_000);
+  const remainingHours = Math.floor(remainingMilliseconds / 3_600_000);
+  const remainingDays = Math.floor(remainingMilliseconds / 86_400_000);
+  if (remainingDays > 0) return `${remainingDays}d`;
+  if (remainingHours > 0) return `${remainingHours}h`;
+  if (remainingMinutes > 0) return `${remainingMinutes}m`;
+  return "<1m";
 }
 
 export function showReport(ctx: ExtensionCommandContext, report: UsageReport, fromCache: boolean): void {
@@ -87,7 +281,13 @@ export function formatQueryErrors(errors: UsageQueryError[], partial = false): s
   const lines = [partial ? "Some provider usage is unavailable:" : "Usage unavailable:"];
   for (const error of errors) {
     const source =
-      error.source === "pi-auth" ? "Codex" : error.source === "codex-app-server" ? "Codex fallback" : "Anthropic";
+      error.source === "pi-auth"
+        ? "Codex"
+        : error.source === "codex-app-server"
+          ? "Codex fallback"
+          : error.source === "anthropic-oauth"
+            ? "Anthropic"
+            : "External adapter";
     lines.push(`- ${source}: ${compactQueryError(error.message)}`);
   }
   return lines.join("\n");
@@ -165,12 +365,6 @@ function codexModelVariantKeys(modelKeys: Set<string>): string[] {
   return [...variants];
 }
 
-function formatStatuslinePrefix(snapshot: NormalizedRateLimitSnapshot): string {
-  if (isPrimaryCodexSnapshot(snapshot)) return "codex";
-  const label = snapshot.limitName ?? snapshot.limitId;
-  return `codex ${compactLimitLabel(label)}`;
-}
-
 function orderReportsForCurrentProvider(
   reports: UsageReport[],
   model: Pick<PiModel, "provider"> | undefined,
@@ -192,6 +386,19 @@ function isPrimaryCodexSnapshot(snapshot: NormalizedRateLimitSnapshot): boolean 
 
 function formatWindowLine(label: string, window: NormalizedRateLimitWindow): string {
   return `  ${label.padEnd(LIMIT_VALUE_COLUMN)}${formatWindow(window)}`;
+}
+
+function formatNormalizedWindowLine(label: string, window: NormalizedUsageWindow): string {
+  const utilization =
+    window.usedPercent === undefined
+      ? USAGE_UNAVAILABLE_TEXT
+      : `${progressBarUsed(window.usedPercent)} ${clampPercent(window.usedPercent).toFixed(0)}% used`;
+  const reset = window.resetsAt ? ` (resets ${formatReset(window.resetsAt)})` : "";
+  const amount =
+    window.usedAmount === undefined
+      ? ""
+      : ` (${window.currency ? `${window.currency} ` : ""}${window.usedAmount}${window.limitAmount === undefined ? "" : `/${window.limitAmount}`})`;
+  return `  ${label.padEnd(LIMIT_VALUE_COLUMN)}${utilization}${amount}${reset}`;
 }
 
 function formatWindow(window: NormalizedRateLimitWindow): string {

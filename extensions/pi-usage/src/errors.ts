@@ -1,6 +1,5 @@
 import { RATE_LIMIT_BACKOFF_MAX_MS, RATE_LIMIT_BACKOFF_MIN_MS, RATE_LIMIT_BACKOFF_MS } from "./constants.js";
 import type { UsageQueryError } from "./types.js";
-import { redactErrorBody } from "./utils.js";
 
 export function isStaleExtensionContextError(error: unknown): boolean {
   return (
@@ -22,8 +21,9 @@ export function isRateLimitErrorMessage(message: string): boolean {
   return /\b429\b|rate_limit_error|rate.?limited/i.test(message);
 }
 
-export function throwUsageEndpointError(provider: string, response: Response, body: string): never {
-  const message = `${provider} usage endpoint returned ${response.status} ${response.statusText}: ${redactErrorBody(body)}`;
+export function throwUsageEndpointError(provider: string, response: Response, _body: string): never {
+  const statusText = response.statusText.replace(/[\r\n\t]/g, " ").trim();
+  const message = `${provider} usage endpoint returned ${response.status}${statusText ? ` ${statusText}` : ""}.`;
   throw new UsageEndpointError(message, response.status === 429 ? parseRetryAfterMs(response) : undefined);
 }
 
