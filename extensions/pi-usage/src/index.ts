@@ -30,6 +30,7 @@
  *   command.ts            /usage command handler
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getOptionalUsageBusV1, isProviderUsageEventV1 } from "./adapter-bus.js";
 import { registerUsageCommand } from "./command.js";
 import { installUsageFooter, isFooterRegistered, setFooterRegistered } from "./footer.js";
 import { isUsageSupportedModel } from "./models.js";
@@ -40,7 +41,9 @@ import {
   rethrowUnlessStaleContextError,
   setSessionActive,
 } from "./statusline.js";
+import { handleProviderUsageEvent, resetProviderWarningState, restoreProviderWarningState } from "./warnings.js";
 
+export { getUsageBusV1, PROVIDER_USAGE_BUS_SYMBOL } from "./adapter-bus.js";
 export { completeCodexStatusArguments, parseArgs } from "./args.js";
 export { isStaleExtensionContextError } from "./errors.js";
 export { formatCodexUsageReport, formatCodexUsageStatusline } from "./format.js";
@@ -51,11 +54,63 @@ export type {
   NormalizedCredits,
   NormalizedRateLimitSnapshot,
   NormalizedRateLimitWindow,
+  NormalizedUsageWindow,
+  ProviderKeyV1,
+  ProviderUsageAdapterV1,
+  ProviderUsageBusV1,
+  ProviderUsageEventV1,
   ProviderUsageModel,
+  ProviderUsageSnapshotV1,
+  UsageScopeV1,
+  UsageStateV1,
 } from "./types.js";
 
 export default function usageExtension(pi: ExtensionAPI) {
   registerUsageCommand(pi);
+
+  type ProviderUsageSubscription = { unsubscribe?: () => void };
+  let activeProviderUsageSubscription: ProviderUsageSubscription | undefined;
+
+  const stopProviderUsageSubscription = () => {
+    const subscription = activeProviderUsageSubscription;
+    activeProviderUsageSubscription = undefined;
+    try {
+      subscription?.unsubscribe?.();
+    } catch {
+      // Optional registry cleanup is best-effort.
+    }
+  };
+
+  const startProviderUsageSubscription = (ctx: ExtensionContext, restoreMarkers: boolean) => {
+    stopProviderUsageSubscription();
+    try {
+      if (restoreMarkers) restoreProviderWarningState(pi, ctx);
+      else resetProviderWarningState(pi);
+      const bus = getOptionalUsageBusV1();
+      if (!bus) return;
+      const subscription: ProviderUsageSubscription = {};
+      activeProviderUsageSubscription = subscription;
+      const unsubscribe = bus.subscribe((event) => {
+        if (activeProviderUsageSubscription !== subscription || !isProviderUsageEventV1(event)) return;
+        try {
+          // Access a guarded context property before snapshot application,
+          // whose fail-closed normalization intentionally returns false.
+          void ctx.sessionManager;
+          handleProviderUsageEvent(pi, ctx, event);
+        } catch (error) {
+          if (handleStaleContextError(ctx, error) && activeProviderUsageSubscription === subscription) {
+            stopProviderUsageSubscription();
+          }
+        }
+      });
+      subscription.unsubscribe = unsubscribe;
+      // A structural bus may invoke a listener synchronously from subscribe.
+      if (activeProviderUsageSubscription !== subscription) unsubscribe();
+    } catch (error) {
+      // Optional bus failures must not escape into pi lifecycle handling.
+      handleStaleContextError(ctx, error);
+    }
+  };
 
   const ensureUsageFooter = (ctx: ExtensionContext) => {
     if (isFooterRegistered() || !ctx.hasUI) return;
@@ -67,9 +122,10 @@ export default function usageExtension(pi: ExtensionAPI) {
     }
   };
 
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", (event, ctx) => {
     setSessionActive(true);
     ensureUsageFooter(ctx);
+    startProviderUsageSubscription(ctx, event.reason !== "fork");
     if (isUsageSupportedModel(ctx.model)) {
       void refreshCurrentUsageStatusline(ctx, ctx.model).catch(rethrowUnlessStaleContextError(ctx));
     } else {
@@ -94,6 +150,7 @@ export default function usageExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
+    stopProviderUsageSubscription();
     setSessionActive(false);
     clearUsageStatusline(ctx);
   });
