@@ -53,7 +53,10 @@ export function redactErrorBody(body: string): string {
   return truncateEnd(
     body
       .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer <redacted>")
-      .replace(/"access_token"\s*:\s*"[^"]+"/gi, '"access_token":"<redacted>"')
+      .replace(/"(?:access|refresh|id)_token"\s*:\s*"[^"]+"/gi, (match) => {
+        const key = match.slice(0, match.indexOf(":"));
+        return `${key}:"<redacted>"`;
+      })
       .trim(),
     MAX_ERROR_BODY_CHARS,
   );
@@ -66,10 +69,27 @@ export function truncateEnd(value: string, maxChars: number): string {
 
 export function prettyJson(text: string): string {
   try {
-    return JSON.stringify(JSON.parse(text), null, 2);
+    return JSON.stringify(redactRawValue(JSON.parse(text) as unknown), null, 2);
   } catch {
-    return text.slice(0, MAX_ERROR_BODY_CHARS * 4);
+    return redactErrorBody(text).slice(0, MAX_ERROR_BODY_CHARS * 4);
   }
+}
+
+function redactRawValue(value: unknown, key = ""): unknown {
+  if (/(?:token|authorization|headers?|(?:account|organi[sz]ation|org)[_-]?(?:id|uuid))/i.test(key)) {
+    return "<redacted>";
+  }
+  if (Array.isArray(value)) return value.map((item) => redactRawValue(item));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([childKey, child]) => [
+        childKey,
+        redactRawValue(child, childKey),
+      ]),
+    );
+  }
+  if (typeof value === "string") return value.replace(/Bearer\s+\S+/gi, "Bearer <redacted>");
+  return value;
 }
 
 export function formatAgeShort(ms: number): string {

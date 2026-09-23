@@ -5,8 +5,8 @@ import { dirname, join } from "node:path";
  * Bundle + minify a pi extension workspace package for npm publish.
  *
  * Reads src/index.ts, writes dist/index.js (single ESM file, comments stripped).
- * Pi host packages (@earendil-works/*) stay external; runtime deps like typebox
- * are bundled in.
+ * Pi host packages (@earendil-works/*) and native runtime dependencies stay
+ * external; portable JavaScript dependencies like typebox are bundled in.
  *
  * Usage (from an extension folder): node ../../scripts/build-extension.mjs
  * Or via npm run build in each workspace package.
@@ -19,12 +19,13 @@ const outfile = join(pkgDir, "dist", "index.js");
 
 mkdirSync(dirname(outfile), { recursive: true });
 
-/** Provided by the pi host at runtime — never bundle these. */
-const PI_EXTERNALS = [
+/** Provided by the pi host or installed beside an extension at runtime. */
+const EXTERNAL_PACKAGES = [
   "@earendil-works/pi-coding-agent",
   "@earendil-works/pi-tui",
   "@earendil-works/pi-ai",
   "@earendil-works/pi-agent-core",
+  "fs-ext-extra-prebuilt",
   "playwright-core",
 ];
 
@@ -38,7 +39,7 @@ const result = await esbuild.build({
   target: "node22",
   legalComments: "none",
   treeShaking: true,
-  external: PI_EXTERNALS,
+  external: EXTERNAL_PACKAGES,
   logLevel: "info",
 });
 
