@@ -13,7 +13,7 @@ jobs:
   sync:
     runs-on: ubuntu-26.04
     steps:
-      - uses: schuettc/tools-actions/fork-sync@v0.1.0
+      - uses: schuettc/tools-actions/fork-sync@v0.10.2
         with:
           upstream_repo: "Sreetej510/pi-extensions"
           upstream_branch: "master"
@@ -21,6 +21,8 @@ jobs:
           pkg_dir: "extensions/pi-usage"
           tag_prefix: "pi-usage-v"
           test_cmd: "npm install --no-audit --no-fund && npm run typecheck -w extensions/pi-usage && npm test -w extensions/pi-usage"
+          # Also test on the newest Node release: pi runs on the machine's Node.
+          test_node_versions: "current"
           build_cmd: "npm install --no-audit --no-fund && npm run build -w extensions/pi-usage"
           force: ${{ inputs.force }}
           dry_run: ${{ inputs.dry_run }}
