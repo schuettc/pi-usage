@@ -17,24 +17,65 @@ const MUTATION_LOCK_RETRY_MS = 5;
 const MUTATION_LOCK_ATTEMPTS = 11;
 const mutationLockWaitArray = new Int32Array(new SharedArrayBuffer(4));
 type FlockSync = typeof NativeFlockSync;
-let mutationLockBackend: FlockSync | undefined;
+
+/** The slice of node:sqlite's DatabaseSync the lock uses. Declared here so the
+ * build does not depend on a Node types version that ships node:sqlite. */
+type SqliteDatabase = { exec(sql: string): void; close(): void; readonly isTransaction?: boolean };
+type SqliteDatabaseConstructor = new (path: string, options: { timeout: number }) => SqliteDatabase;
+
+/** A kernel-held mutation lock. Both backends take a lock the kernel releases
+ * when the holder closes it or dies, so there is no stale-owner metadata, PID
+ * liveness decision, or takeover path to race. */
+type MutationLockBackend =
+  | { kind: "flock"; flockSync: FlockSync }
+  | { kind: "sqlite"; Database: SqliteDatabaseConstructor };
+let mutationLockBackend: MutationLockBackend | undefined;
 let mutationLockBackendResolved = false;
 
-/** Resolve the required kernel-lock implementation only when a mutation is
- * attempted. A missing, incompatible, or damaged native addon disables cache
- * mutation for this process; reads and the rest of the extension stay usable.
+/** Resolve a kernel-lock implementation only when a mutation is attempted,
+ * in order:
+ *   1. the native flock addon (fs-ext-extra-prebuilt), where a prebuilt binary
+ *      exists for this Node major;
+ *   2. node:sqlite, whose exclusive transaction holds a POSIX fcntl lock. It is
+ *      built into Node, so a new Node major (Node 26 has no fs-ext prebuilt)
+ *      does not disable the shared cache. It is second because Node 22 prints
+ *      an ExperimentalWarning for it.
+ * With neither, cache mutation is disabled for this process; reads and the
+ * rest of the extension stay usable.
+ *
+ * flock and fcntl locks do not see each other. Every session on one Node
+ * resolves the same backend, so they only differ across a Node major upgrade
+ * with sessions still running on the old one. Then two writers can overlap;
+ * each replaces the cache by atomic rename, so the cost is a lost update or a
+ * duplicate refresh, never a corrupt file.
  */
-function resolveMutationLockBackend(): FlockSync | undefined {
+function resolveMutationLockBackend(): MutationLockBackend | undefined {
   if (mutationLockBackendResolved) return mutationLockBackend;
   mutationLockBackendResolved = true;
+  let require: NodeJS.Require;
   try {
-    const createRequire = getMutationLockRequireFactory();
-    const require = createRequire(import.meta.url);
+    require = getMutationLockRequireFactory()(import.meta.url);
+  } catch {
+    return undefined;
+  }
+  try {
     const candidate: unknown = require("fs-ext-extra-prebuilt");
-    if (typeof candidate !== "object" || candidate === null) return undefined;
-    const flockSync = Reflect.get(candidate, "flockSync");
-    if (typeof flockSync !== "function") return undefined;
-    mutationLockBackend = flockSync as FlockSync;
+    const flockSync =
+      typeof candidate === "object" && candidate !== null ? Reflect.get(candidate, "flockSync") : undefined;
+    if (typeof flockSync === "function") {
+      mutationLockBackend = { kind: "flock", flockSync: flockSync as FlockSync };
+      return mutationLockBackend;
+    }
+  } catch {
+    // No prebuilt binary for this Node major, or a damaged addon: try sqlite.
+  }
+  try {
+    const candidate: unknown = require("node:sqlite");
+    const Database =
+      typeof candidate === "object" && candidate !== null ? Reflect.get(candidate, "DatabaseSync") : undefined;
+    if (typeof Database === "function") {
+      mutationLockBackend = { kind: "sqlite", Database: Database as SqliteDatabaseConstructor };
+    }
   } catch {
     mutationLockBackend = undefined;
   }
@@ -223,24 +264,38 @@ export function readSharedUsageCache(): SharedUsageCache | undefined {
   }
 }
 
-type MutationLock = { descriptor: number; flockSync: FlockSync };
+/** An acquired mutation lock. verify reasserts ownership just before the cache
+ * is replaced; release is safe to call once, even after a failed verify. */
+type MutationLock = { verify(): boolean; release(): void };
 
-/**
- * The lock path is a permanent rendezvous inode: this module never renames or
- * unlinks it. flock ownership belongs to the open file description, so the
- * kernel releases it on close or process death. There is consequently no
- * stale-owner metadata, PID liveness decision, or takeover path to race.
- */
+/** Retry acquire every MUTATION_LOCK_RETRY_MS for MUTATION_LOCK_ATTEMPTS tries
+ * (a bounded wait of about 50ms), giving up on the last. */
+function withBoundedRetry(tryOnce: () => boolean): boolean {
+  for (let attempt = 0; attempt < MUTATION_LOCK_ATTEMPTS; attempt += 1) {
+    if (tryOnce()) return true;
+    if (attempt + 1 < MUTATION_LOCK_ATTEMPTS) Atomics.wait(mutationLockWaitArray, 0, 0, MUTATION_LOCK_RETRY_MS);
+  }
+  return false;
+}
+
 function tryAcquireMutationLock(): MutationLock | undefined {
-  const flockSync = resolveMutationLockBackend();
-  if (!flockSync) return undefined;
+  const backend = resolveMutationLockBackend();
+  if (!backend) return undefined;
 
   try {
     mkdirSync(dirname(runtime.cacheFile), { recursive: true });
   } catch {
     return undefined;
   }
+  return backend.kind === "flock" ? tryAcquireFlock(backend.flockSync) : tryAcquireSqliteLock(backend.Database);
+}
 
+/**
+ * The lock path is a permanent rendezvous inode: this module never renames or
+ * unlinks it. flock ownership belongs to the open file description, so the
+ * kernel releases it on close or process death.
+ */
+function tryAcquireFlock(flockSync: FlockSync): MutationLock | undefined {
   let descriptor: number;
   try {
     descriptor = openSync(`${runtime.cacheFile}.lock`, "a+");
@@ -249,54 +304,105 @@ function tryAcquireMutationLock(): MutationLock | undefined {
     return undefined;
   }
 
-  for (let attempt = 0; attempt < MUTATION_LOCK_ATTEMPTS; attempt += 1) {
+  const acquired = withBoundedRetry(() => {
     try {
       flockSync(descriptor, "exnb");
-      runtime.mutationLockPhase?.("after-acquire");
-      return { descriptor, flockSync };
+      return true;
     } catch {
-      if (attempt + 1 >= MUTATION_LOCK_ATTEMPTS) {
-        try {
-          closeSync(descriptor);
-        } catch {
-          // The descriptor may have failed independently of lock contention.
-        }
-        return undefined;
-      }
-      Atomics.wait(mutationLockWaitArray, 0, 0, MUTATION_LOCK_RETRY_MS);
+      return false;
     }
+  });
+  if (!acquired) {
+    try {
+      closeSync(descriptor);
+    } catch {
+      // The descriptor may have failed independently of lock contention.
+    }
+    return undefined;
   }
-  return undefined;
+  runtime.mutationLockPhase?.("after-acquire");
+  return {
+    verify() {
+      try {
+        // Reasserting LOCK_EX|LOCK_NB on the same open file description is an
+        // atomic kernel ownership check. The descriptor remains locked across
+        // the following rename, so there is no reusable-path check/use window.
+        flockSync(descriptor, "exnb");
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    release() {
+      try {
+        // Closing the open file description releases flock ownership even if
+        // an explicit unlock would fail. A process crash does the same.
+        closeSync(descriptor);
+      } catch {
+        // Best-effort: already closed, or closed when this process exits.
+      }
+    },
+  };
 }
 
-function verifyMutationLock(lock: MutationLock): boolean {
+/**
+ * A separate rendezvous file from the flock inode, since the two lock kinds
+ * never see each other. BEGIN EXCLUSIVE takes SQLite's exclusive lock (a POSIX
+ * fcntl lock on the file); the kernel drops it when the connection closes or
+ * the process dies. Nothing is ever written, so the file stays an empty
+ * database and no journal is created.
+ */
+function tryAcquireSqliteLock(Database: SqliteDatabaseConstructor): MutationLock | undefined {
+  let db: SqliteDatabase;
   try {
-    // Reasserting LOCK_EX|LOCK_NB on the same open file description is an
-    // atomic kernel ownership check. The descriptor remains locked across the
-    // following rename, so there is no reusable-path check/use window.
-    lock.flockSync(lock.descriptor, "exnb");
-    return true;
+    // timeout 0: contention fails at once, and the bounded retry below waits.
+    db = new Database(`${runtime.cacheFile}.lock.sqlite`, { timeout: 0 });
+    runtime.mutationLockPhase?.("after-open");
   } catch {
-    return false;
+    return undefined;
   }
-}
 
-function releaseMutationLock(lock: MutationLock): void {
-  try {
-    // Closing the open file description releases flock ownership even if an
-    // explicit unlock would fail. A process crash performs the same cleanup.
-    closeSync(lock.descriptor);
-  } catch {
-    // Best-effort: the descriptor is either already closed or will be closed
-    // automatically when this process exits.
+  const acquired = withBoundedRetry(() => {
+    try {
+      db.exec("BEGIN EXCLUSIVE");
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  if (!acquired) {
+    try {
+      db.close();
+    } catch {
+      // Already closed; the kernel holds nothing for this connection.
+    }
+    return undefined;
   }
+  runtime.mutationLockPhase?.("after-acquire");
+  return {
+    // A live connection's exclusive lock cannot be taken from it, so holding
+    // the transaction is holding the lock.
+    verify: () => db.isTransaction !== false,
+    release() {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Closing below ends the transaction and releases the lock anyway.
+      }
+      try {
+        db.close();
+      } catch {
+        // Best-effort: closed when this process exits.
+      }
+    },
+  };
 }
 
 function writeCacheAtomically(cacheFile: SharedUsageCache, lock: MutationLock): boolean {
   const tmpFile = `${runtime.cacheFile}.${process.pid}.${runtime.randomUUID()}.tmp`;
   try {
     writeFileSync(tmpFile, JSON.stringify(cacheFile));
-    if (!verifyMutationLock(lock)) return false;
+    if (!lock.verify()) return false;
     runtime.mutationLockPhase?.("before-cache-replace");
     runtime.rename(tmpFile, runtime.cacheFile);
     runtime.mutationLockPhase?.("after-cache-replace");
@@ -325,7 +431,7 @@ function mutateSharedUsageCache<T>(fallback: T, mutate: (cacheFile: SharedUsageC
   } catch {
     return fallback;
   } finally {
-    releaseMutationLock(lock);
+    lock.release();
   }
 }
 
