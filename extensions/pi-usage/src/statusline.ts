@@ -278,6 +278,36 @@ function reportMatchesCurrentAccount(report: UsageReport, currentAccountId: stri
   return report.account?.id === currentAccountId;
 }
 
+/** The adapter that would have produced this external-adapter report, found
+ * by its adapterId or, failing that, by matching usage provider and
+ * modelProviders — mirrors `adapterForModel`'s matching rules. */
+function adapterForReport(report: UsageReport): ProviderUsageAdapterV1 | undefined {
+  if (report.source !== "external-adapter") return undefined;
+  const adapters = getUsageAdaptersV1();
+  if (report.adapterId) return adapters.find((adapter) => adapter.id === report.adapterId);
+  return adapters.find(
+    (adapter) =>
+      adapter.usageProvider === report.provider &&
+      report.modelProviders.some((provider) => adapter.modelProviders.includes(provider)),
+  );
+}
+
+/** Drops any external-adapter report whose account no longer matches its
+ * adapter's current account. The single filter every `/usage`-command and
+ * statusline display path must go through before a report list is shown or
+ * retained as a stale fallback — see `reportMatchesCurrentAccount` above for
+ * the per-model variant used while a specific model is already selected. */
+export function reportsForCurrentAccounts(reports: UsageReport[]): UsageReport[] {
+  return reports.filter((report) => {
+    if (report.source !== "external-adapter") return true;
+    const adapter = adapterForReport(report);
+    if (!adapter) return true;
+    const currentAccount = currentAccountForAdapter(adapter.id);
+    if (!currentAccount) return true;
+    return report.account?.id === currentAccount.id;
+  });
+}
+
 const getCachedReportForModel = (
   model: ProviderUsageModel | undefined,
   now: number,
@@ -496,7 +526,7 @@ export function applyCurrentProviderStatusline(
   reports: UsageReport[],
   cached?: { createdAt: number; stale: boolean },
 ): boolean {
-  const current = reports.find((report) => reportMatchesModel(report, ctx.model));
+  const current = reportsForCurrentAccounts(reports).find((report) => reportMatchesModel(report, ctx.model));
   if (!current) {
     setStatuslineValue(ctx, undefined);
     return false;
