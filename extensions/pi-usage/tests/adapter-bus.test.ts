@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getUsageBusV1 } from "../src/adapter-bus.js";
+import { currentAccountForAdapter, getUsageBusV1 } from "../src/adapter-bus.js";
 import { isUsageSupportedModel } from "../src/models.js";
 import { queryUsage } from "../src/query.js";
 import {
@@ -274,6 +274,47 @@ void test("keeps a successful claude-bridge adapter report selected in the statu
 
     clearUsageStatusline(ctx);
     configureStatuslineForTests();
+  });
+});
+
+void test("currentAccountForAdapter resolves the registered adapter's current account", async () => {
+  await withCleanBus(async () => {
+    const bus = getUsageBusV1();
+    bus.register({
+      ...adapter("with-account"),
+      currentAccount: () => ({ id: "c33cb52c", label: "fundamental@example.com" }),
+    });
+    bus.register(adapter("without-account"));
+    bus.register({
+      ...adapter("throwing-account"),
+      currentAccount: () => {
+        throw new Error("boom");
+      },
+    });
+    bus.register({
+      ...adapter("invalid-account"),
+      currentAccount: () => ({ id: "" }) as never,
+    });
+
+    assert.deepEqual(currentAccountForAdapter("with-account"), {
+      id: "c33cb52c",
+      label: "fundamental@example.com",
+    });
+    assert.equal(currentAccountForAdapter("without-account"), undefined);
+    assert.equal(currentAccountForAdapter("throwing-account"), undefined);
+    assert.equal(currentAccountForAdapter("invalid-account"), undefined);
+    assert.equal(currentAccountForAdapter("unregistered"), undefined);
+  });
+});
+
+void test("rejects an adapter whose currentAccount is not a function", async () => {
+  await withCleanBus(() => {
+    const bus = getUsageBusV1();
+    const invalid = { ...adapter("bad-current-account"), currentAccount: "nope" } as unknown as ProviderUsageAdapterV1;
+
+    bus.register(invalid);
+
+    assert.deepEqual(bus.adapters(), []);
   });
 });
 

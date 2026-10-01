@@ -2,6 +2,7 @@ import type {
   AdapterUsageReport,
   NormalizedUsageWindow,
   ProviderUsageSnapshotV1,
+  UsageAccountV1,
   UsageScopeV1,
   UsageStateV1,
 } from "./types.js";
@@ -26,11 +27,16 @@ export function normalizeExternalUsageSnapshot(
     source: "external-adapter",
     snapshotSource: snapshot.source,
     ...(snapshot.adapterId === undefined ? {} : { adapterId: snapshot.adapterId }),
+    ...(snapshot.account === undefined ? {} : { account: snapshot.account }),
     complete: snapshot.complete,
     modelProviders: [...modelProviders],
     capturedAt: snapshot.capturedAt,
     windows: snapshot.windows.map(normalizeExternalWindow),
   };
+}
+
+export function isUsageAccountV1(value: unknown): value is UsageAccountV1 {
+  return isRecord(value) && isNonEmptyString(value.id) && (value.label === undefined || isNonEmptyString(value.label));
 }
 
 export function isProviderUsageSnapshotV1(value: unknown): value is ProviderUsageSnapshotV1 {
@@ -64,6 +70,9 @@ function assertProviderUsageSnapshotV1(value: unknown): asserts value is Provide
   }
   if (value.adapterId !== undefined && !isNonEmptyString(value.adapterId)) {
     throw new Error("External usage snapshot adapterId must be a non-empty string.");
+  }
+  if (value.account !== undefined && !isUsageAccountV1(value.account)) {
+    throw new Error("External usage snapshot account must have a non-empty id and an optional non-empty label.");
   }
   if (!Array.isArray(value.windows)) {
     throw new Error("External usage snapshot windows must be an array.");
