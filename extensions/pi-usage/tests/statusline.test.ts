@@ -18,6 +18,7 @@ import {
   applyProviderUsageSnapshot,
   configureStatuslineForTests,
   refreshCurrentUsageStatusline,
+  reportsForCurrentAccounts,
   setCombinedCache,
   setSessionActive,
 } from "../src/statusline.js";
@@ -898,6 +899,86 @@ void test("hides a previous account's report when the adapter's current account 
       assert.equal(statuses.at(-1), "Claude · 5h 46%");
       assert.equal(statuses.includes("Claude · 5h 5%"), true);
       assert.equal(statuses.filter((status) => status === "Claude · 5h 5%").length, 1);
+    } finally {
+      unregister();
+    }
+  });
+});
+
+void test("an account-less displayed report is treated as stale once the adapter resolves a current account", async () => {
+  await withHarness(async ({ timers }) => {
+    const model = { provider: "claude-bridge", id: "claude-sonnet", name: "Claude Sonnet" };
+    // Starts with no opinion so the account-less snapshot below is accepted and
+    // displayed, then "learns" an account — mimicking an adapter whose account
+    // resolution lags its first refresh.
+    let currentAccountId: string | undefined;
+    const unregister = getUsageBusV1().register({
+      id: "bridge",
+      usageProvider: "claude",
+      modelProviders: ["claude-bridge"],
+      currentAccount: () => (currentAccountId ? { id: currentAccountId } : undefined),
+      refresh: async () => {
+        throw new Error("not used in this test");
+      },
+    });
+    try {
+      // No `account` field at all — as an older adapter, or a pre-account-aware
+      // snapshot, would publish.
+      const snapshot: ProviderUsageSnapshotV1 = {
+        version: 1,
+        provider: "claude",
+        source: "test-adapter",
+        adapterId: "bridge",
+        capturedAt: NOW,
+        complete: true,
+        windows: [{ id: "five_hour", label: "5h", usedPercent: 5, scope: { kind: "account" } }],
+      };
+      const statuses: Array<string | undefined> = [];
+      const ctx = context(model, statuses);
+      assert.equal(applyProviderUsageSnapshot(ctx, snapshot), true);
+      assert.equal(statuses.at(-1), "Claude · 5h 5%");
+
+      currentAccountId = "c33cb52c";
+      const minuteTimer = timers.find((timer) => timer.delayMs === 60_000 && !timer.cleared);
+      assert.ok(minuteTimer);
+      minuteTimer.callback();
+
+      // The adapter now has an opinion (account c33cb52c) and the displayed
+      // report predates account tracking, so the countdown tick must treat it
+      // as stale and trigger a refresh rather than silently keep rerendering it.
+      assert.equal(statuses.at(-1), "checking");
+    } finally {
+      unregister();
+    }
+  });
+});
+
+void test("reportsForCurrentAccounts drops an account-less report once its adapter resolves a current account", async () => {
+  await withHarness(async () => {
+    const unregister = getUsageBusV1().register({
+      id: "bridge",
+      usageProvider: "claude",
+      modelProviders: ["claude-bridge"],
+      currentAccount: () => ({ id: "c33cb52c" }),
+      refresh: async () => {
+        throw new Error("not used in this test");
+      },
+    });
+    try {
+      const accountLessReport = {
+        provider: "claude" as const,
+        source: "external-adapter" as const,
+        snapshotSource: "test-adapter",
+        adapterId: "bridge",
+        complete: true,
+        modelProviders: ["claude-bridge"],
+        capturedAt: NOW,
+        windows: [{ id: "five_hour", label: "5h", usedPercent: 5, scope: { kind: "account" as const } }],
+      };
+      assert.deepEqual(reportsForCurrentAccounts([accountLessReport]), []);
+
+      const sameAccountReport = { ...accountLessReport, account: { id: "c33cb52c" } };
+      assert.deepEqual(reportsForCurrentAccounts([sameAccountReport]), [sameAccountReport]);
     } finally {
       unregister();
     }

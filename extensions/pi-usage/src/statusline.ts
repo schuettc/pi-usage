@@ -40,6 +40,7 @@ import type {
   ProviderUsageModel,
   ProviderUsageSnapshotV1,
   QueryUsageResult,
+  UsageAccountV1,
   UsageProviderKey,
   UsageReport,
 } from "./types.js";
@@ -258,18 +259,30 @@ function adapterForModel(model: ProviderUsageModel | undefined): ProviderUsageAd
   return getUsageAdaptersV1().find((adapter) => adapter.modelProviders.includes(model.provider));
 }
 
+/** The one rule for whether `report` still belongs to `currentAccount`: a
+ * native report always does, and an external-adapter report does when it has
+ * no `currentAccount` to compare against (the adapter has no opinion) or its
+ * account id matches. An account-less external-adapter report is NOT treated
+ * as belonging once an adapter resolves a current account at all — that
+ * adapter now tracks accounts, so a report with no account predates that and
+ * must be treated as stale/filtered, same as a report for a different id. */
+function reportBelongsToAccount(report: UsageReport, currentAccount: UsageAccountV1 | undefined): boolean {
+  if (report.source !== "external-adapter") return true;
+  if (!currentAccount) return true;
+  return report.account?.id === currentAccount.id;
+}
+
 /** Whether a report must be hidden because it was measured for a different
- * account than the one the model's adapter is about to use next. A report
- * with no account, or an adapter that cannot say which account is current,
- * is never filtered out — this is strictly additive to pre-account-aware
- * behavior. */
+ * account than the one the model's adapter is about to use next. An adapter
+ * that cannot say which account is current never filters anything out — this
+ * is strictly additive to pre-account-aware behavior. */
 function reportAccountHasChanged(report: UsageReport, model: ProviderUsageModel | undefined): boolean {
-  if (report.source !== "external-adapter" || !report.account) return false;
+  if (report.source !== "external-adapter") return false;
   const adapter = adapterForModel(model);
   if (!adapter) return false;
   const currentAccount = currentAccountForAdapter(adapter.id);
   if (!currentAccount) return false;
-  return currentAccount.id !== report.account.id;
+  return !reportBelongsToAccount(report, currentAccount);
 }
 
 function reportMatchesCurrentAccount(report: UsageReport, currentAccountId: string | undefined): boolean {
@@ -303,8 +316,7 @@ export function reportsForCurrentAccounts(reports: UsageReport[]): UsageReport[]
     const adapter = adapterForReport(report);
     if (!adapter) return true;
     const currentAccount = currentAccountForAdapter(adapter.id);
-    if (!currentAccount) return true;
-    return report.account?.id === currentAccount.id;
+    return reportBelongsToAccount(report, currentAccount);
   });
 }
 
