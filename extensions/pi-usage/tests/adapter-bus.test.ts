@@ -223,8 +223,7 @@ void test("supports and queries a non-native model through its adapter", async (
 
 void test("keeps a successful claude-bridge adapter report selected in the statusline", async () => {
   await withCleanBus(async () => {
-    // Reset statusline runtime so the account tag stays off regardless of the
-    // developer's ~/.claude.json.
+    // Reset statusline runtime state left by earlier tests.
     configureStatuslineForTests();
     getUsageBusV1().register(
       adapter(
