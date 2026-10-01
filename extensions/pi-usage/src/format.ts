@@ -1,5 +1,5 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { resolveAnthropicAccountEmail } from "./anthropic-account.js";
+import { resolveReportAccountLabel } from "./adapter-bus.js";
 import { BAR_SEGMENTS, LIMIT_VALUE_COLUMN, RESET_FOREGROUND, USAGE_UNAVAILABLE_TEXT } from "./constants.js";
 import { isOpenAICodexModel, reportMatchesModel } from "./models.js";
 import type {
@@ -91,29 +91,10 @@ export function formatUsageStatusline(report: UsageReport, model?: ProviderUsage
   return formatCodexUsageStatusline(report, model);
 }
 
-export function formatUsageReport(
-  report: UsageReport,
-  cacheAgeMs?: number,
-  emailResolver: () => string | undefined = resolveAnthropicAccountEmail,
-): string {
+export function formatUsageReport(report: UsageReport, cacheAgeMs?: number): string {
   if (report.source === "external-adapter") return formatAdapterUsageReport(report);
-  if (report.provider === "claude") return formatAnthropicSummaryWithAccount(report.summaryLines, emailResolver);
+  if (report.provider === "claude") return report.summaryLines.join("\n");
   return formatCodexUsageReport(report, cacheAgeMs);
-}
-
-/** Appends the charged-against account email to the Anthropic header at DISPLAY
- * time. The email is resolved here (never persisted to the cached report). The
- * resolver is injectable so this path is deterministically testable. */
-function formatAnthropicSummaryWithAccount(
-  summaryLines: string[],
-  emailResolver: () => string | undefined = resolveAnthropicAccountEmail,
-): string {
-  const email = emailResolver();
-  if (!email) return summaryLines.join("\n");
-  const lines = [...summaryLines];
-  const headerIndex = lines.findIndex((line) => line.includes(">_ Anthropic Usage"));
-  if (headerIndex >= 0) lines[headerIndex] = `${lines[headerIndex]} (${email})`;
-  return lines.join("\n");
 }
 
 function formatNormalizedUsageStatusline(
@@ -164,7 +145,9 @@ function formatNormalizedUsageStatusline(
 
 function formatAdapterUsageReport(report: AdapterUsageReport): string {
   const providerLabel = report.providerLabel ?? (report.provider === "claude" ? "Claude" : "OpenAI Codex");
-  const lines = [`  >_ ${providerLabel} Usage`, ""];
+  const accountLabel = resolveReportAccountLabel(report);
+  const header = accountLabel ? `${providerLabel} Usage (${accountLabel})` : `${providerLabel} Usage`;
+  const lines = [`  >_ ${header}`, ""];
   const usableWindows = report.windows.filter(isUsableNormalizedWindow);
   if (usableWindows.length === 0) {
     lines.push("  Usage unavailable");
