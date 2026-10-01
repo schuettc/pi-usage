@@ -33,7 +33,7 @@ void test("a require setup failure is lazy, contained, and cached", async () => 
     assert.equal(requireFactoryAttempts, 0, "imports must not set up the native mutation backend");
     assert.equal(providerQueryCalls, 0, "import must not query a usage provider");
 
-    const original: SharedUsageCache = { version: 2, entries: {} };
+    const original: SharedUsageCache = { version: 3, entries: {} };
     writeFileSync(cacheFile, JSON.stringify(original));
     sharedCache.configureSharedCacheForTests({ cacheFile, now: () => NOW });
 

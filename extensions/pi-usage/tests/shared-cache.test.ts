@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { CACHE_TTL_MS, REFRESH_LEASE_MS } from "../src/constants.js";
 import {
+  cacheKeyFor,
   configureSharedCacheForTests,
   readFreshReportForModel,
   readSharedUsageCache,
@@ -12,7 +13,7 @@ import {
   saveSharedUsageReport,
   tryAcquireRefreshLease,
 } from "../src/shared-cache.js";
-import type { AnthropicUsageReport, CodexUsageReport, SharedUsageCache } from "../src/types.js";
+import type { AdapterUsageReport, AnthropicUsageReport, CodexUsageReport, SharedUsageCache } from "../src/types.js";
 import {
   resumeMutationPhase,
   startCacheWriter,
@@ -300,7 +301,7 @@ void test("concurrent child writers preserve both provider updates", async () =>
 
 void test("a simulated rename failure preserves valid cache JSON", () => {
   withCache((cacheFile) => {
-    const original: SharedUsageCache = { version: 2, entries: {} };
+    const original: SharedUsageCache = { version: 3, entries: {} };
     writeFileSync(cacheFile, JSON.stringify(original));
     configureSharedCacheForTests({
       cacheFile,
@@ -313,5 +314,72 @@ void test("a simulated rename failure preserves valid cache JSON", () => {
     assert.doesNotThrow(() => saveSharedUsageReport(report(), NOW));
     assert.deepEqual(JSON.parse(readFileSync(cacheFile, "utf8")), original);
     assert.deepEqual(readSharedUsageCache(), original);
+  });
+});
+
+function adapterReport(overrides: Partial<AdapterUsageReport> = {}): AdapterUsageReport {
+  return {
+    provider: "claude",
+    source: "external-adapter",
+    snapshotSource: "test-adapter",
+    adapterId: "bridge",
+    complete: true,
+    modelProviders: ["claude-bridge"],
+    capturedAt: NOW,
+    windows: [],
+    ...overrides,
+  };
+}
+
+void test("a v2 cache file with a claude entry is discarded entirely after the v3 upgrade", () => {
+  withCache((cacheFile) => {
+    writeFileSync(
+      cacheFile,
+      JSON.stringify({
+        version: 2,
+        entries: {
+          claude: { createdAt: NOW - 1_000, report: anthropicReport(NOW - 1_000) },
+          codex: { createdAt: NOW - 1_000, report: report(NOW - 1_000) },
+        },
+      }),
+    );
+
+    assert.equal(readSharedUsageCache(), undefined);
+    assert.equal(readFreshReportForModel(model, NOW), undefined);
+  });
+});
+
+void test("external-adapter reports for different accounts of the same provider are cached under distinct keys", () => {
+  withCache(() => {
+    const workshop = adapterReport({ account: { id: "launch" } });
+    const fundamental = adapterReport({ account: { id: "c33cb52c" }, capturedAt: NOW + 1 });
+
+    saveSharedUsageReport(workshop, NOW);
+    saveSharedUsageReport(fundamental, NOW + 1);
+
+    const shared = readSharedUsageCache();
+    assert.deepEqual(shared?.entries[cacheKeyFor("claude", "launch")]?.report, workshop);
+    assert.deepEqual(shared?.entries[cacheKeyFor("claude", "c33cb52c")]?.report, fundamental);
+    assert.equal(shared?.entries.claude, undefined);
+  });
+});
+
+void test("an account's label is never persisted, only its id", () => {
+  withCache(() => {
+    saveSharedUsageReport(adapterReport({ account: { id: "c33cb52c", label: "fundamental@example.com" } }), NOW);
+
+    const shared = readSharedUsageCache();
+    const stored = shared?.entries[cacheKeyFor("claude", "c33cb52c")]?.report;
+    assert.equal(stored?.source, "external-adapter");
+    assert.deepEqual((stored as AdapterUsageReport).account, { id: "c33cb52c" });
+    assert.equal(JSON.stringify(shared).includes("fundamental@example.com"), false);
+  });
+});
+
+void test("an external-adapter report with no account still has a bare provider key", () => {
+  withCache(() => {
+    saveSharedUsageReport(adapterReport(), NOW);
+
+    assert.deepEqual(readSharedUsageCache()?.entries.claude?.report, adapterReport());
   });
 });

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getUsageAdaptersV1 } from "./adapter-bus.js";
+import { currentAccountForAdapter, getUsageAdaptersV1 } from "./adapter-bus.js";
 import { resolveAnthropicAccountEmail } from "./anthropic-account.js";
 import {
   ANTHROPIC_PROVIDER_ID,
@@ -23,6 +23,7 @@ import {
 import { normalizeExternalUsageSnapshot } from "./normalize-external.js";
 import { queryUsageWithRetries } from "./query.js";
 import {
+  cacheKeyFor,
   isSharedCacheMutationAvailable,
   readFreshReportForModel,
   readSharedUsageCache,
@@ -35,6 +36,7 @@ import {
 } from "./shared-cache.js";
 import type {
   CachedReport,
+  ProviderUsageAdapterV1,
   ProviderUsageModel,
   ProviderUsageSnapshotV1,
   QueryUsageResult,
@@ -190,6 +192,12 @@ const scheduleCountdownRerender = (
   const rerender = () => {
     statuslineCountdownTimer = undefined;
     if (!sessionActive || requestId !== statuslineRequestId) return;
+    if (model && reportAccountHasChanged(report, model)) {
+      if (setStatuslineValue(ctx, "checking")) {
+        void refreshCurrentUsageStatusline(ctx, model).catch(rethrowUnlessStaleContextError(ctx));
+      }
+      return;
+    }
     let text = renderStatuslineText(report, model);
     if (text === undefined) return;
     if (stale) text = `${text} (${formatAgeShort(Math.max(0, runtime.now() - report.capturedAt))} old)`;
@@ -243,11 +251,43 @@ function isPreferredOver(candidate: CachedReport, current: CachedReport): boolea
   return candidate.createdAt > current.createdAt;
 }
 
-const getCachedReportForModel = (model: ProviderUsageModel | undefined, now: number): CachedReport | undefined => {
+/** The adapter registered for a model's provider, if any. Models backed
+ * natively (Anthropic OAuth, Codex) have no bus adapter. */
+function adapterForModel(model: ProviderUsageModel | undefined): ProviderUsageAdapterV1 | undefined {
+  if (!model) return undefined;
+  return getUsageAdaptersV1().find((adapter) => adapter.modelProviders.includes(model.provider));
+}
+
+/** Whether a report must be hidden because it was measured for a different
+ * account than the one the model's adapter is about to use next. A report
+ * with no account, or an adapter that cannot say which account is current,
+ * is never filtered out — this is strictly additive to pre-account-aware
+ * behavior. */
+function reportAccountHasChanged(report: UsageReport, model: ProviderUsageModel | undefined): boolean {
+  if (report.source !== "external-adapter" || !report.account) return false;
+  const adapter = adapterForModel(model);
+  if (!adapter) return false;
+  const currentAccount = currentAccountForAdapter(adapter.id);
+  if (!currentAccount) return false;
+  return currentAccount.id !== report.account.id;
+}
+
+function reportMatchesCurrentAccount(report: UsageReport, currentAccountId: string | undefined): boolean {
+  if (report.source !== "external-adapter") return true;
+  if (currentAccountId === undefined) return true;
+  return report.account?.id === currentAccountId;
+}
+
+const getCachedReportForModel = (
+  model: ProviderUsageModel | undefined,
+  now: number,
+  currentAccountId: string | undefined,
+): CachedReport | undefined => {
+  const matchesAccount = (report: UsageReport) => reportMatchesCurrentAccount(report, currentAccountId);
   try {
-    let best = cache && reportMatchesModel(cache.report, model) ? cache : undefined;
+    let best = cache && reportMatchesModel(cache.report, model) && matchesAccount(cache.report) ? cache : undefined;
     if (combinedCache) {
-      const report = combinedCache.reports.find((item) => reportMatchesModel(item, model));
+      const report = combinedCache.reports.find((item) => reportMatchesModel(item, model) && matchesAccount(item));
       if (report) {
         const candidate = { createdAt: combinedCache.createdAt, report };
         if (!best || isPreferredOver(candidate, best)) best = candidate;
@@ -257,15 +297,15 @@ const getCachedReportForModel = (model: ProviderUsageModel | undefined, now: num
     // Another pi session may have fetched more recently — use its data. The
     // freshness helper is the fast path; the raw read retains stale data for
     // display while a coordinated refresh is in flight.
-    let shared = readFreshReportForModel(model, now);
+    let shared = readFreshReportForModel(model, now, matchesAccount);
     for (const entry of Object.values(readSharedUsageCache()?.entries ?? {})) {
-      if (!entry?.report || !reportMatchesModel(entry.report, model)) continue;
+      if (!entry?.report || !reportMatchesModel(entry.report, model) || !matchesAccount(entry.report)) continue;
       if (!shared || isPreferredOver(entry, shared)) shared = entry;
     }
     if (shared && (!best || isPreferredOver(shared, best))) best = shared;
     return best;
   } catch {
-    return cache && reportMatchesModel(cache.report, model) ? cache : undefined;
+    return cache && reportMatchesModel(cache.report, model) && matchesAccount(cache.report) ? cache : undefined;
   }
 };
 
@@ -293,10 +333,7 @@ function usageProviderForModel(model: ProviderUsageModel): UsageProviderKey {
   if (isAnthropicModel(model) || isOpenAICodexModel(model)) {
     return providerKeyForModel(model);
   }
-  return (
-    getUsageAdaptersV1().find((adapter) => adapter.modelProviders.includes(model.provider))?.usageProvider ??
-    providerKeyForModel(model)
-  );
+  return adapterForModel(model)?.usageProvider ?? providerKeyForModel(model);
 }
 
 export async function refreshCurrentUsageStatusline(ctx: ExtensionContext, model?: ProviderUsageModel): Promise<void> {
@@ -320,7 +357,9 @@ export async function refreshCurrentUsageStatusline(ctx: ExtensionContext, model
   const requestId = statuslineRequestId + 1;
   statuslineRequestId = requestId;
   const now = runtime.now();
-  const cached = getCachedReportForModel(selectedModel, now);
+  const selectedAdapterForAccount = adapterForModel(selectedModel);
+  const currentAccount = selectedAdapterForAccount && currentAccountForAdapter(selectedAdapterForAccount.id);
+  const cached = getCachedReportForModel(selectedModel, now, currentAccount?.id);
   const cacheAgeMs = cached ? now - cached.createdAt : Number.POSITIVE_INFINITY;
   const cacheIsComplete = cached?.report.source !== "external-adapter" || cached.report.complete;
   const freshCached = cached && cacheIsComplete && cacheAgeMs >= 0 && cacheAgeMs < CACHE_TTL_MS ? cached : undefined;
@@ -486,11 +525,21 @@ export function applyProviderUsageSnapshot(ctx: ExtensionContext, snapshot: Prov
           adapter.modelProviders.includes(ctx.model.provider),
       );
     if (selectedAdapter && selectedAdapter.usageProvider !== snapshot.provider) return false;
-    const previous = findPreviousAdapterReport(snapshot.provider, snapshot.adapterId ?? selectedAdapter?.id);
+    const previous = findPreviousAdapterReport(
+      snapshot.provider,
+      snapshot.adapterId ?? selectedAdapter?.id,
+      snapshot.account?.id,
+    );
+    // An adapter report matches only its own modelProviders — adding the
+    // native provider here would let it bleed into native model selection
+    // for every account, not just the one it was measured on. The native
+    // provider is only a last-resort fallback so the array is never empty
+    // when no adapter could be matched at all.
     const nativeProvider = snapshot.provider === "claude" ? ANTHROPIC_PROVIDER_ID : CODEX_PROVIDER_ID;
-    const modelProviders = [
-      ...new Set([...(previous?.modelProviders ?? []), ...(selectedAdapter?.modelProviders ?? []), nativeProvider]),
+    const matchedModelProviders = [
+      ...new Set([...(previous?.modelProviders ?? []), ...(selectedAdapter?.modelProviders ?? [])]),
     ];
+    const modelProviders = matchedModelProviders.length > 0 ? matchedModelProviders : [nativeProvider];
     const normalized = normalizeExternalUsageSnapshot(
       snapshot.adapterId === undefined && selectedAdapter ? { ...snapshot, adapterId: selectedAdapter.id } : snapshot,
       modelProviders,
@@ -501,7 +550,8 @@ export function applyProviderUsageSnapshot(ctx: ExtensionContext, snapshot: Prov
       (candidate) =>
         candidate.source !== "external-adapter" ||
         candidate.provider !== report.provider ||
-        candidate.adapterId !== report.adapterId,
+        candidate.adapterId !== report.adapterId ||
+        candidate.account?.id !== report.account?.id,
     );
     combinedCache = { createdAt: now, reports: [...retainedReports, report] };
     saveSharedUsageReport(report, now);
@@ -520,13 +570,19 @@ export function applyProviderUsageSnapshot(ctx: ExtensionContext, snapshot: Prov
 function findPreviousAdapterReport(
   provider: UsageProviderKey,
   adapterId: string | undefined,
+  accountId: string | undefined,
 ): Extract<UsageReport, { source: "external-adapter" }> | undefined {
-  const reports = [cache?.report, ...(combinedCache?.reports ?? []), readSharedUsageCache()?.entries[provider]?.report];
+  const reports = [
+    cache?.report,
+    ...(combinedCache?.reports ?? []),
+    readSharedUsageCache()?.entries[cacheKeyFor(provider, accountId)]?.report,
+  ];
   return reports.find(
     (report): report is Extract<UsageReport, { source: "external-adapter" }> =>
       report?.source === "external-adapter" &&
       report.provider === provider &&
-      (adapterId === undefined || report.adapterId === adapterId),
+      (adapterId === undefined || report.adapterId === adapterId) &&
+      report.account?.id === accountId,
   );
 }
 

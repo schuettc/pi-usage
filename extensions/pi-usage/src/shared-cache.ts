@@ -179,6 +179,10 @@ function isCodexSnapshot(value: unknown): boolean {
   return value.credits === undefined || isNormalizedCredits(value.credits);
 }
 
+function isPersistedAccount(value: unknown): boolean {
+  return isRecord(value) && nonEmptyString(value.id) && (value.label === undefined || nonEmptyString(value.label));
+}
+
 function isUsageReport(value: unknown, provider: UsageProviderKey): value is UsageReport {
   if (!isRecord(value) || value.provider !== provider) return false;
   if (typeof value.capturedAt !== "number" || !Number.isFinite(value.capturedAt)) return false;
@@ -188,6 +192,7 @@ function isUsageReport(value: unknown, provider: UsageProviderKey): value is Usa
       (value.providerLabel === undefined || nonEmptyString(value.providerLabel)) &&
       nonEmptyString(value.snapshotSource) &&
       (value.adapterId === undefined || nonEmptyString(value.adapterId)) &&
+      (value.account === undefined || isPersistedAccount(value.account)) &&
       typeof value.complete === "boolean" &&
       Array.isArray(value.modelProviders) &&
       value.modelProviders.length > 0 &&
@@ -244,11 +249,34 @@ function isRefreshLeaseMap(value: unknown): boolean {
   });
 }
 
+/** A disk cache entry key: the bare provider ("claude", "codex"), or
+ * "<provider>@<accountId>" for an external-adapter report measured against a
+ * specific account. */
+export function cacheKeyFor(provider: UsageProviderKey, accountId: string | undefined): string {
+  return accountId ? `${provider}@${accountId}` : provider;
+}
+
+function parseCacheKey(key: string): { provider: UsageProviderKey; accountId?: string } | undefined {
+  const at = key.indexOf("@");
+  const providerPart = at === -1 ? key : key.slice(0, at);
+  if (providerPart !== "codex" && providerPart !== "claude") return undefined;
+  if (at === -1) return { provider: providerPart };
+  const accountId = key.slice(at + 1);
+  if (accountId.trim().length === 0) return undefined;
+  return { provider: providerPart, accountId };
+}
+
 function isSharedUsageCache(value: unknown): value is SharedUsageCache {
   if (!isRecord(value) || value.version !== SHARED_CACHE_VERSION || !isRecord(value.entries)) return false;
-  for (const provider of ["codex", "claude"] as const) {
-    const entry = value.entries[provider];
-    if (entry !== undefined && !isSharedCacheEntry(entry, provider)) return false;
+  for (const [key, entry] of Object.entries(value.entries)) {
+    if (entry === undefined) continue;
+    const parsed = parseCacheKey(key);
+    if (!parsed) return false;
+    if (!isSharedCacheEntry(entry, parsed.provider)) return false;
+    if (parsed.accountId !== undefined) {
+      const report = (entry as SharedCacheEntry).report;
+      if (report.source !== "external-adapter" || report.account?.id !== parsed.accountId) return false;
+    }
   }
   if (value.backoffUntil !== undefined && !isProviderNumberMap(value.backoffUntil)) return false;
   if (value.refreshLeases !== undefined && !isRefreshLeaseMap(value.refreshLeases)) return false;
@@ -435,14 +463,23 @@ function mutateSharedUsageCache<T>(fallback: T, mutate: (cacheFile: SharedUsageC
   }
 }
 
+/** Never persist the account's label (the email) — only the opaque id. */
+function stripAccountLabel(report: UsageReport): UsageReport {
+  if (report.source !== "external-adapter" || !report.account) return report;
+  return { ...report, account: { id: report.account.id } };
+}
+
 export function saveSharedUsageReport(
   report: UsageReport,
   now: number = Date.now(),
   backoffProvider: UsageProviderKey = report.provider,
 ): void {
   if (!Number.isFinite(now)) return;
+  const accountId = report.source === "external-adapter" ? report.account?.id : undefined;
+  const key = cacheKeyFor(report.provider, accountId);
+  const toStore = stripAccountLabel(report);
   mutateSharedUsageCache(undefined, (cacheFile) => {
-    cacheFile.entries[report.provider] = { createdAt: now, report };
+    cacheFile.entries[key] = { createdAt: now, report: toStore };
     if (cacheFile.backoffUntil) {
       delete cacheFile.backoffUntil[backoffProvider];
       if (Object.keys(cacheFile.backoffUntil).length === 0) cacheFile.backoffUntil = undefined;
@@ -451,10 +488,11 @@ export function saveSharedUsageReport(
   });
 }
 
-export function clearSharedUsageReport(provider: UsageProviderKey): void {
+export function clearSharedUsageReport(provider: UsageProviderKey, accountId?: string): void {
+  const key = cacheKeyFor(provider, accountId);
   mutateSharedUsageCache(undefined, (cacheFile) => {
-    if (!cacheFile.entries[provider]) return { changed: false, value: undefined };
-    delete cacheFile.entries[provider];
+    if (!cacheFile.entries[key]) return { changed: false, value: undefined };
+    delete cacheFile.entries[key];
     return { changed: true, value: undefined };
   });
 }
@@ -532,11 +570,12 @@ export function releaseRefreshLease(provider: UsageProviderKey, owner: string): 
 export function readFreshReportForModel(
   model: ProviderUsageModel | undefined,
   now: number,
+  matches: (report: UsageReport) => boolean = () => true,
 ): SharedCacheEntry | undefined {
   try {
     let best: SharedCacheEntry | undefined;
     for (const entry of Object.values(readSharedUsageCache()?.entries ?? {})) {
-      if (!entry || !reportMatchesModel(entry.report, model)) continue;
+      if (!entry || !reportMatchesModel(entry.report, model) || !matches(entry.report)) continue;
       const ageMs = now - entry.createdAt;
       if (ageMs < 0 || ageMs >= CACHE_TTL_MS) continue;
       if (!best || entry.createdAt > best.createdAt) best = entry;
