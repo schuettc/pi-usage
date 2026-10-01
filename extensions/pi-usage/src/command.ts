@@ -25,6 +25,7 @@ import {
   getCombinedCache,
   handleStaleContextError,
   isSessionActive,
+  reportsForCurrentAccounts,
   setCombinedCache,
   setStatuslineChecking,
 } from "./statusline.js";
@@ -135,6 +136,16 @@ export function registerUsageCommand(pi: ExtensionAPI): void {
         if (cached) {
           const configuredReports = filterReportsForConfiguredProviders(ctx, cached.reports);
           cached = configuredReports.length > 0 ? { ...cached, reports: configuredReports } : undefined;
+        }
+        if (cached) {
+          // A report for the current model whose account no longer matches the
+          // adapter's current account must never be shown or retained as a
+          // stale fallback below — treat this as a cache miss so the query path
+          // fetches the current account instead of showing nothing.
+          const hadModelReport = cached.reports.some((report) => reportMatchesModel(report, ctx.model));
+          const accountSafeReports = reportsForCurrentAccounts(cached.reports);
+          const stillHasModelReport = accountSafeReports.some((report) => reportMatchesModel(report, ctx.model));
+          cached = hadModelReport && !stillHasModelReport ? undefined : { ...cached, reports: accountSafeReports };
         }
         if (cached && !options.value.refresh) {
           applyCurrentProviderStatusline(ctx, cached.reports);
