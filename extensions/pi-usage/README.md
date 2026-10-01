@@ -8,7 +8,7 @@ usage / rate-limit budgets — OpenAI Codex, Anthropic OAuth, and pi-auth-backed
 
 - Queries the active model's provider usage endpoint (Codex app-server usage/rate-limit-reset
   APIs, or Anthropic's OAuth usage API) and renders remaining budget/reset windows.
-- Caches results on disk (`~/.pi/agent/usage-cache.json`) for a few minutes so multiple
+- Caches results on disk (`~/.pi/agent/usage-cache-v3.json`) for a few minutes so multiple
   concurrent pi sessions don't hammer the provider APIs.
 - Pushes a compact usage summary into the statusline, refreshed automatically with retry/backoff
   on rate limits (`429`).
@@ -44,7 +44,7 @@ keep its own standalone warning policy. Without any optional adapter, pi-usage r
 native Codex and Anthropic OAuth queries and cache.
 
 ## Shared state
-Snapshots are cached at `~/.pi/agent/usage-cache.json`. The cache contains normalized usage only, never access
+Snapshots are cached at `~/.pi/agent/usage-cache-v3.json`. The cache contains normalized usage only, never access
 tokens, raw responses, or account emails or names. Claude entries from an adapter are keyed by the adapter's
 opaque account id.
 

@@ -5,7 +5,7 @@ import { join } from "node:path";
 /** Resolve the Anthropic account the OAuth usage is charged against.
  *
  * Read at DISPLAY time only — the account email is NEVER written to
- * usage-cache.json (the README guarantees the cache holds no account
+ * usage-cache-v3.json (the README guarantees the cache holds no account
  * identifiers). Best-effort: returns `undefined` on any error and never throws.
  * The config path is a parameter (defaulting to `~/.claude.json`) so tests can
  * inject a fixture. */
