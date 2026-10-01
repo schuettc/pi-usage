@@ -7,6 +7,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getUsageBusV1 } from "../src/adapter-bus.js";
 import { CACHE_TTL_MS, REFRESH_LEASE_MS } from "../src/constants.js";
 import {
+  cacheKeyFor,
   configureSharedCacheForTests,
   readSharedUsageCache,
   saveSharedBackoff,
@@ -692,7 +693,7 @@ void test("a partial bridge snapshot merges by stable window identity and retain
       assert.equal(report?.source, "external-adapter");
       if (report?.source !== "external-adapter") return;
       assert.equal(report.adapterId, "schuettc.pi-claude-bridge");
-      assert.deepEqual(report.modelProviders, ["claude-bridge", "anthropic"]);
+      assert.deepEqual(report.modelProviders, ["claude-bridge"]);
       assert.deepEqual(
         report.windows.map(({ id, usedPercent, state }) => ({ id, usedPercent, state })),
         [
@@ -739,7 +740,7 @@ void test("a native claude report beats a newer external-adapter report for an a
           source: "external-adapter",
           snapshotSource: "claude-code-rate-limit-event",
           complete: true,
-          modelProviders: ["claude-bridge", "anthropic"],
+          modelProviders: ["claude-bridge"],
           capturedAt: NOW,
           windows: [{ id: "five_hour", label: "5h", usedPercent: 99, scope: { kind: "account" } }],
         },
@@ -827,11 +828,185 @@ void test("adapter snapshot application updates shared cache and the selected fo
           snapshotSource: "test-adapter",
           adapterId: "claude-bridge",
           complete: true,
-          modelProviders: ["claude-bridge", "anthropic"],
+          modelProviders: ["claude-bridge"],
           capturedAt: NOW,
           windows: snapshot.windows,
         },
       });
+    } finally {
+      unregister();
+    }
+  });
+});
+
+void test("hides a previous account's report when the adapter's current account changes, until the new account's snapshot arrives", async () => {
+  await withHarness(async ({ setQuery }) => {
+    const model = { provider: "claude-bridge", id: "claude-sonnet", name: "Claude Sonnet" };
+    let currentAccountId = "launch";
+    const unregister = getUsageBusV1().register({
+      id: "bridge",
+      usageProvider: "claude",
+      modelProviders: ["claude-bridge"],
+      currentAccount: () => ({ id: currentAccountId }),
+      refresh: async () => {
+        throw new Error("not used in this test");
+      },
+    });
+    try {
+      const snapshotA: ProviderUsageSnapshotV1 = {
+        version: 1,
+        provider: "claude",
+        source: "test-adapter",
+        adapterId: "bridge",
+        capturedAt: NOW,
+        complete: true,
+        account: { id: "launch" },
+        windows: [{ id: "five_hour", label: "5h", usedPercent: 5, scope: { kind: "account" } }],
+      };
+      const statuses: Array<string | undefined> = [];
+      const ctx = context(model, statuses);
+      assert.equal(applyProviderUsageSnapshot(ctx, snapshotA), true);
+      assert.equal(statuses.at(-1), "Claude · 5h 5%");
+
+      currentAccountId = "c33cb52c";
+      let resolveQuery!: (result: QueryUsageResult) => void;
+      setQuery(
+        () =>
+          new Promise((resolve) => {
+            resolveQuery = resolve;
+          }),
+      );
+
+      const refresh = refreshCurrentUsageStatusline(ctx, model);
+      assert.equal(statuses.at(-1), "checking");
+
+      resolveQuery({
+        ok: true,
+        report: {
+          provider: "claude",
+          source: "external-adapter",
+          snapshotSource: "test-adapter",
+          adapterId: "bridge",
+          complete: true,
+          modelProviders: ["claude-bridge"],
+          account: { id: "c33cb52c" },
+          capturedAt: NOW,
+          windows: [{ id: "five_hour", label: "5h", usedPercent: 46, scope: { kind: "account" } }],
+        },
+      });
+      await refresh;
+      assert.equal(statuses.at(-1), "Claude · 5h 46%");
+      assert.equal(statuses.includes("Claude · 5h 5%"), true);
+      assert.equal(statuses.filter((status) => status === "Claude · 5h 5%").length, 1);
+    } finally {
+      unregister();
+    }
+  });
+});
+
+void test("a disk cache entry for another account is ignored while the adapter reports a different current account", async () => {
+  await withHarness(async ({ setQuery }) => {
+    const model = { provider: "claude-bridge", id: "claude-sonnet", name: "Claude Sonnet" };
+    const unregister = getUsageBusV1().register({
+      id: "bridge",
+      usageProvider: "claude",
+      modelProviders: ["claude-bridge"],
+      currentAccount: () => ({ id: "c33cb52c" }),
+      refresh: async () => {
+        throw new Error("not used in this test");
+      },
+    });
+    try {
+      saveSharedUsageReport(
+        {
+          provider: "claude",
+          source: "external-adapter",
+          snapshotSource: "other-session",
+          adapterId: "bridge",
+          complete: true,
+          modelProviders: ["claude-bridge"],
+          account: { id: "launch" },
+          capturedAt: NOW,
+          windows: [{ id: "five_hour", label: "5h", usedPercent: 11, scope: { kind: "account" } }],
+        },
+        NOW,
+      );
+      setQuery(async () => ({
+        ok: true,
+        report: {
+          provider: "claude",
+          source: "external-adapter",
+          snapshotSource: "test-adapter",
+          adapterId: "bridge",
+          complete: true,
+          modelProviders: ["claude-bridge"],
+          account: { id: "c33cb52c" },
+          capturedAt: NOW,
+          windows: [{ id: "five_hour", label: "5h", usedPercent: 46, scope: { kind: "account" } }],
+        },
+      }));
+      const statuses: Array<string | undefined> = [];
+      await refreshCurrentUsageStatusline(context(model, statuses), model);
+
+      assert.equal(statuses.includes("Claude · 5h 11%"), false);
+      assert.equal(statuses.at(-1), "Claude · 5h 46%");
+    } finally {
+      unregister();
+    }
+  });
+});
+
+void test("a partial snapshot for one account does not merge into another account's prior report", async () => {
+  await withHarness(async () => {
+    const model = { provider: "claude-bridge", id: "claude-sonnet", name: "Claude Sonnet" };
+    const unregister = getUsageBusV1().register({
+      id: "bridge",
+      usageProvider: "claude",
+      modelProviders: ["claude-bridge"],
+      refresh: async () => {
+        throw new Error("not used in this test");
+      },
+    });
+    try {
+      const completeA: ProviderUsageSnapshotV1 = {
+        version: 1,
+        provider: "claude",
+        source: "test-adapter",
+        adapterId: "bridge",
+        capturedAt: NOW,
+        complete: true,
+        account: { id: "launch" },
+        windows: [
+          { id: "five_hour", label: "5h", usedPercent: 10, scope: { kind: "account" } },
+          { id: "seven_day", label: "7d", usedPercent: 20, scope: { kind: "account" } },
+        ],
+      };
+      assert.equal(applyProviderUsageSnapshot(context(model, []), completeA), true);
+
+      const partialB: ProviderUsageSnapshotV1 = {
+        version: 1,
+        provider: "claude",
+        source: "test-adapter",
+        adapterId: "bridge",
+        capturedAt: NOW + 1,
+        complete: false,
+        account: { id: "c33cb52c" },
+        windows: [{ id: "five_hour", label: "5h", usedPercent: 99, scope: { kind: "account" } }],
+      };
+      assert.equal(applyProviderUsageSnapshot(context(model, []), partialB), true);
+
+      const stored = readSharedUsageCache()?.entries[cacheKeyFor("claude", "c33cb52c")]?.report;
+      assert.equal(stored?.source, "external-adapter");
+      if (stored?.source !== "external-adapter") return;
+      assert.deepEqual(
+        stored.windows.map(({ id, usedPercent }) => ({ id, usedPercent })),
+        [{ id: "five_hour", usedPercent: 99 }],
+      );
+
+      const retainedA = readSharedUsageCache()?.entries[cacheKeyFor("claude", "launch")]?.report;
+      assert.equal(retainedA?.source, "external-adapter");
+      if (retainedA?.source !== "external-adapter") return;
+      assert.equal(retainedA.windows.length, 2);
     } finally {
       unregister();
     }

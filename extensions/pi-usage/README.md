@@ -45,7 +45,8 @@ native Codex and Anthropic OAuth queries and cache.
 
 ## Shared state
 Snapshots are cached at `~/.pi/agent/usage-cache.json`. The cache contains normalized usage only, never access
-tokens, raw responses, or account identifiers.
+tokens, raw responses, or account emails or names. Claude entries from an adapter are keyed by the adapter's
+opaque account id.
 
 ## Commands
 

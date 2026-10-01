@@ -298,8 +298,10 @@ export type UsageProviderKey = ProviderKeyV1;
 export type SharedCacheEntry = { createdAt: number; report: UsageReport };
 
 export type SharedUsageCache = {
-  version: 2;
-  entries: Partial<Record<ProviderKeyV1, SharedCacheEntry>>;
+  version: 3;
+  /** Keyed by provider ("claude", "codex"), or "<provider>@<accountId>" for an
+   * external-adapter report measured against a specific account. */
+  entries: Partial<Record<string, SharedCacheEntry>>;
   backoffUntil?: Partial<Record<ProviderKeyV1, number>>;
   refreshLeases?: Partial<Record<ProviderKeyV1, { owner: string; expiresAt: number }>>;
 };

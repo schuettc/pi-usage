@@ -25,7 +25,7 @@ export const RATE_LIMIT_BACKOFF_MIN_MS = 30 * 1000;
 export const RATE_LIMIT_BACKOFF_MAX_MS = 60 * 60 * 1000;
 /** Shared on-disk usage cache so concurrent pi sessions don't each hit the APIs. */
 export const SHARED_CACHE_FILE = join(homedir(), ".pi", "agent", "usage-cache.json");
-export const SHARED_CACHE_VERSION = 2;
+export const SHARED_CACHE_VERSION = 3;
 export const STATUS_KEY = "provider-usage";
 export const BAR_SEGMENTS = 20;
 export const LIMIT_VALUE_COLUMN = 29;
