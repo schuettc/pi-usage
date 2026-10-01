@@ -76,6 +76,34 @@ void test("rejects every malformed public snapshot and window field", () => {
   }
 });
 
+void test("carries a valid account through normalization", () => {
+  const withAccount = snapshot({ account: { id: "c33cb52c", label: "fundamental@example.com" } });
+  assert.deepEqual(normalizeExternalUsageSnapshot(withAccount, modelProviders).account, {
+    id: "c33cb52c",
+    label: "fundamental@example.com",
+  });
+
+  const accountWithoutLabel = snapshot({ account: { id: "launch" } });
+  assert.deepEqual(normalizeExternalUsageSnapshot(accountWithoutLabel, modelProviders).account, { id: "launch" });
+
+  assert.equal(normalizeExternalUsageSnapshot(snapshot(), modelProviders).account, undefined);
+});
+
+void test("rejects a malformed account", () => {
+  const cases: Array<Record<string, unknown> | undefined> = [
+    { id: "" },
+    { id: "ok", label: "" },
+    { label: "missing-id@example.com" },
+    "not-an-object" as unknown as Record<string, unknown>,
+  ];
+  for (const account of cases) {
+    assert.throws(
+      () => normalizeExternalUsageSnapshot(snapshot({ account: account as never }), modelProviders),
+      /account/i,
+    );
+  }
+});
+
 void test("clamps percentages, accepts unknown model labels, and strips extra material", () => {
   const input = {
     ...snapshot(),

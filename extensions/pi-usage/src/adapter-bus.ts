@@ -1,5 +1,5 @@
-import { isProviderUsageSnapshotV1 } from "./normalize-external.js";
-import type { ProviderUsageAdapterV1, ProviderUsageBusV1, ProviderUsageEventV1 } from "./types.js";
+import { isProviderUsageSnapshotV1, isUsageAccountV1 } from "./normalize-external.js";
+import type { ProviderUsageAdapterV1, ProviderUsageBusV1, ProviderUsageEventV1, UsageAccountV1 } from "./types.js";
 
 export const PROVIDER_USAGE_BUS_SYMBOL = Symbol.for("pi.provider-usage.bus.v1");
 const globalRegistry = globalThis as typeof globalThis & Record<symbol, unknown>;
@@ -42,6 +42,20 @@ export function getUsageAdaptersV1(): ProviderUsageAdapterV1[] {
     return Array.isArray(adapters) ? adapters.filter(isProviderUsageAdapterV1) : [];
   } catch {
     return [];
+  }
+}
+
+/** The account the named adapter's next refresh will measure, or undefined
+ * when the adapter has no currentAccount method, throws, or returns
+ * something invalid. */
+export function currentAccountForAdapter(adapterId: string): UsageAccountV1 | undefined {
+  try {
+    const adapter = getUsageAdaptersV1().find((candidate) => candidate.id === adapterId);
+    if (!adapter?.currentAccount) return undefined;
+    const account = adapter.currentAccount();
+    return isUsageAccountV1(account) ? account : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -107,7 +121,8 @@ function isProviderUsageAdapterV1(value: unknown): value is ProviderUsageAdapter
     Array.isArray(value.modelProviders) &&
     value.modelProviders.length > 0 &&
     value.modelProviders.every(nonEmptyString) &&
-    typeof value.refresh === "function"
+    typeof value.refresh === "function" &&
+    (value.currentAccount === undefined || typeof value.currentAccount === "function")
   );
 }
 

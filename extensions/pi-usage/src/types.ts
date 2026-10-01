@@ -62,6 +62,13 @@ export type NormalizedUsageWindow = {
   currency?: string;
 };
 
+/** An account identified on the bus. id is opaque and stable; label (the
+ * account's email) is display-only and never persisted by pi-usage. */
+export type UsageAccountV1 = {
+  id: string;
+  label?: string;
+};
+
 export type ProviderUsageSnapshotV1 = {
   version: 1;
   provider: ProviderKeyV1;
@@ -70,6 +77,8 @@ export type ProviderUsageSnapshotV1 = {
   capturedAt: number; // epoch milliseconds
   complete: boolean;
   adapterId?: string;
+  /** The account these numbers were measured for. Absent from older publishers. */
+  account?: UsageAccountV1;
   windows: NormalizedUsageWindow[];
 };
 
@@ -95,6 +104,8 @@ export type ProviderUsageAdapterV1 = {
   usageProvider: ProviderKeyV1;
   modelProviders: string[];
   refresh(options: { timeoutMs: number; signal?: AbortSignal }): Promise<ProviderUsageSnapshotV1>;
+  /** The account the adapter's next refresh will measure. Absent from older adapters. */
+  currentAccount?(): UsageAccountV1 | undefined;
 };
 
 export type ProviderUsageBusV1 = {
@@ -114,6 +125,7 @@ export type AdapterUsageReport = {
   complete: boolean;
   modelProviders: string[];
   capturedAt: number;
+  account?: UsageAccountV1;
   windows: NormalizedUsageWindow[];
 };
 
