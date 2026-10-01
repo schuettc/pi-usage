@@ -183,16 +183,9 @@ void test("does not render a report for an unsupported or different provider", (
   assert.equal(reportMatchesModel(codexAdapterReport, unsupportedModel), false);
 });
 
-test("formatUsageReport tags the Anthropic header with the injected account email", () => {
-  const withEmail = formatUsageReport(anthropicReport, undefined, () => "court@subaud.io");
-  const header = withEmail.split("\n").find((line) => line.includes(">_ Anthropic Usage"));
-  assert.ok(header, "expected an Anthropic Usage header line");
-  assert.match(header as string, /\(court@subaud\.io\)/);
-});
-
-test("formatUsageReport omits the account tag when no email resolves", () => {
-  const withoutEmail = formatUsageReport(anthropicReport, undefined, () => undefined);
-  const header = withoutEmail.split("\n").find((line) => line.includes(">_ Anthropic Usage"));
+test("formatUsageReport never labels a native Claude report (Decision 3: labeling native reports is a follow-up)", () => {
+  const text = formatUsageReport(anthropicReport);
+  const header = text.split("\n").find((line) => line.includes(">_ Anthropic Usage"));
   assert.ok(header, "expected an Anthropic Usage header line");
   assert.doesNotMatch(header as string, /\(/);
 });

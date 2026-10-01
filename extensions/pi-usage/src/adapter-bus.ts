@@ -1,5 +1,11 @@
 import { isProviderUsageSnapshotV1, isUsageAccountV1 } from "./normalize-external.js";
-import type { ProviderUsageAdapterV1, ProviderUsageBusV1, ProviderUsageEventV1, UsageAccountV1 } from "./types.js";
+import type {
+  ProviderUsageAdapterV1,
+  ProviderUsageBusV1,
+  ProviderUsageEventV1,
+  UsageAccountV1,
+  UsageReport,
+} from "./types.js";
 
 export const PROVIDER_USAGE_BUS_SYMBOL = Symbol.for("pi.provider-usage.bus.v1");
 const globalRegistry = globalThis as typeof globalThis & Record<symbol, unknown>;
@@ -57,6 +63,36 @@ export function currentAccountForAdapter(adapterId: string): UsageAccountV1 | un
   } catch {
     return undefined;
   }
+}
+
+/** The adapter that would have produced this external-adapter report, found
+ * by its adapterId or, failing that, by matching usage provider and
+ * modelProviders. */
+export function adapterForReport(report: UsageReport): ProviderUsageAdapterV1 | undefined {
+  if (report.source !== "external-adapter") return undefined;
+  const adapters = getUsageAdaptersV1();
+  if (report.adapterId) return adapters.find((adapter) => adapter.id === report.adapterId);
+  return adapters.find(
+    (adapter) =>
+      adapter.usageProvider === report.provider &&
+      report.modelProviders.some((provider) => adapter.modelProviders.includes(provider)),
+  );
+}
+
+/** The label to show for the account a report was measured against: the
+ * report's own account label (set at publish time), else the label its
+ * producing adapter currently gives that same account id, else none — e.g.
+ * when the report came from disk (labels are never persisted) or the adapter
+ * has since moved to a different account. Never applies to native reports,
+ * which carry no account at all. */
+export function resolveReportAccountLabel(report: UsageReport): string | undefined {
+  if (report.source !== "external-adapter" || !report.account) return undefined;
+  if (report.account.label) return report.account.label;
+  const adapter = adapterForReport(report);
+  if (!adapter) return undefined;
+  const currentAccount = currentAccountForAdapter(adapter.id);
+  if (!currentAccount || currentAccount.id !== report.account.id) return undefined;
+  return currentAccount.label;
 }
 
 function createUsageBusV1(): ProviderUsageBusV1 {

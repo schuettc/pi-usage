@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { currentAccountForAdapter, getUsageAdaptersV1 } from "./adapter-bus.js";
-import { resolveAnthropicAccountEmail } from "./anthropic-account.js";
+import {
+  adapterForReport,
+  currentAccountForAdapter,
+  getUsageAdaptersV1,
+  resolveReportAccountLabel,
+} from "./adapter-bus.js";
 import {
   ANTHROPIC_PROVIDER_ID,
   CACHE_TTL_MS,
@@ -52,7 +56,6 @@ type StatuslineRuntime = {
   queryUsage: (ctx: ExtensionContext, options: { timeoutMs: number }) => Promise<QueryUsageResult>;
   setTimeout: (callback: () => void, delayMs: number) => StatuslineTimer;
   clearTimeout: (timer: StatuslineTimer) => void;
-  resolveAccountEmail: () => string | undefined;
 };
 
 const defaultRuntime: StatuslineRuntime = {
@@ -60,7 +63,6 @@ const defaultRuntime: StatuslineRuntime = {
   queryUsage: queryUsageWithRetries,
   setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
   clearTimeout: (timer) => clearTimeout(timer),
-  resolveAccountEmail: resolveAnthropicAccountEmail,
 };
 const refreshLeaseOwner = `${process.pid}:${randomUUID()}`;
 let runtime = defaultRuntime;
@@ -108,9 +110,7 @@ const clearStatuslineTimers = () => {
  * This keeps tests off the real cache/network without changing production use. */
 export function configureStatuslineForTests(overrides: Partial<StatuslineRuntime> = {}): void {
   clearStatuslineTimers();
-  // Tests must be deterministic regardless of the developer's ~/.claude.json, so
-  // the account resolver is off unless a test explicitly overrides it.
-  runtime = { ...defaultRuntime, resolveAccountEmail: () => undefined, ...overrides };
+  runtime = { ...defaultRuntime, ...overrides };
   cache = undefined;
   combinedCache = undefined;
   statuslineRequestId = 0;
@@ -291,20 +291,6 @@ function reportMatchesCurrentAccount(report: UsageReport, currentAccountId: stri
   return report.account?.id === currentAccountId;
 }
 
-/** The adapter that would have produced this external-adapter report, found
- * by its adapterId or, failing that, by matching usage provider and
- * modelProviders — mirrors `adapterForModel`'s matching rules. */
-function adapterForReport(report: UsageReport): ProviderUsageAdapterV1 | undefined {
-  if (report.source !== "external-adapter") return undefined;
-  const adapters = getUsageAdaptersV1();
-  if (report.adapterId) return adapters.find((adapter) => adapter.id === report.adapterId);
-  return adapters.find(
-    (adapter) =>
-      adapter.usageProvider === report.provider &&
-      report.modelProviders.some((provider) => adapter.modelProviders.includes(provider)),
-  );
-}
-
 /** Drops any external-adapter report whose account no longer matches its
  * adapter's current account. The single filter every `/usage`-command and
  * statusline display path must go through before a report list is shown or
@@ -351,18 +337,19 @@ const getCachedReportForModel = (
   }
 };
 
-/** Renders the statusline text and, for Anthropic/claude reports, tags it with
- * the account the usage is charged against. The email is resolved at render
- * time and NEVER persisted to the cache or report objects. */
+/** Renders the statusline text and, for an external-adapter report, tags it
+ * with the account the usage was measured against: the report's own account
+ * label, else the label the adapter now gives that same account id, else no
+ * label at all. Resolved at render time and NEVER persisted to the cache or
+ * report objects. */
 function renderStatuslineText(report: UsageReport, model: ProviderUsageModel | undefined): string | undefined {
   const text = formatUsageStatusline(report, model);
-  if (text === undefined) return undefined;
-  if (report.provider !== "claude" || text === USAGE_UNAVAILABLE_TEXT) return text;
-  const email = runtime.resolveAccountEmail();
-  if (!email) return text;
+  if (text === undefined || text === USAGE_UNAVAILABLE_TEXT) return text;
+  const label = resolveReportAccountLabel(report);
+  if (!label) return text;
   const match = text.match(/^(\S+)([\s\S]*)$/);
   if (!match) return text;
-  return `${match[1]}(${email})${match[2]}`;
+  return `${match[1]}(${label})${match[2]}`;
 }
 
 function clearRefreshTimer(): void {
