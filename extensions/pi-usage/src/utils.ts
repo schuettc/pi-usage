@@ -132,6 +132,27 @@ export function formatCurrencyAmount(amountMajorUnits: number, currencyCode: str
   return symbol ? `${symbol}${formatted}` : `${currencyCode} ${formatted}`;
 }
 
+/** Money for the spend/overage window (the only shape for money, see contract.md):
+ * `Intl.NumberFormat("en-US", { style: "currency" })` for a known currency code,
+ * at the requested decimal places. An absent or invalid currency code falls back
+ * to a plain grouped number with 2 decimals and no symbol — never throws. */
+export function formatMoneyAmount(amount: number, currency: string | undefined, decimals: number): string {
+  if (!Number.isFinite(amount)) return String(amount);
+  if (currency) {
+    try {
+      return new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency,
+        minimumFractionDigits: decimals,
+        maximumFractionDigits: decimals,
+      }).format(amount);
+    } catch {
+      // Invalid currency code (e.g. not ISO 4217) — fall through to the plain-number form.
+    }
+  }
+  return new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(amount);
+}
+
 export function compactLimitLabel(label: string): string {
   const normalized = label.replace(/[_-]+/g, " ").trim();
   const codexVariant = normalized.match(/\bcodex\s+(.+)$/i)?.[1]?.trim();

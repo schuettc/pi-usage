@@ -3,7 +3,7 @@ import test from "node:test";
 import { formatCodexUsageReport, formatUsageReport, formatUsageStatusline } from "../src/format.js";
 import { reportMatchesModel } from "../src/models.js";
 import { normalizeAnthropicUsagePayload } from "../src/normalize-anthropic.js";
-import type { AdapterUsageReport, CodexUsageReport, ProviderUsageModel } from "../src/types.js";
+import type { AdapterUsageReport, CodexUsageReport, NormalizedUsageWindow, ProviderUsageModel } from "../src/types.js";
 
 const now = Date.parse("2026-09-12T13:00:00Z");
 const anthropicReport = normalizeAnthropicUsagePayload(
@@ -118,7 +118,7 @@ void test("preserves native Anthropic financial status while rendering matched m
     );
     assert.equal(
       formatUsageStatusline(financialAnthropicReport, model("anthropic", "fable", "Claude Fable")),
-      "Claude · Cinder Cove 60% · Fable 5h 75% ↻2h · Fable 7d 41% ↻5d · overage 50%",
+      "Claude · Cinder Cove 60% · Fable 5h 75% ↻2h · Fable 7d 41% ↻5d · overage $5.00/$10.00 50%",
     );
   } finally {
     Date.now = originalNow;
@@ -188,4 +188,129 @@ test("formatUsageReport never labels a native Claude report (Decision 3: labelin
   const header = text.split("\n").find((line) => line.includes(">_ Anthropic Usage"));
   assert.ok(header, "expected an Anthropic Usage header line");
   assert.doesNotMatch(header as string, /\(/);
+});
+
+// Decision 4: a consumption account's spend, from the `enterprise_fundamental`
+// fixture (fixtures.json): used_credits 6944 / monthly_limit 500000, both /100
+// (decimal_places 2) => $69.44 of $5,000; utilization 1.3888 => 1%; resetsAt
+// 1793491200 (epoch seconds).
+function spendAdapterReport(window: Partial<NormalizedUsageWindow> = {}): AdapterUsageReport {
+  return {
+    provider: "claude",
+    source: "external-adapter",
+    snapshotSource: "claude-code-usage-control",
+    complete: true,
+    modelProviders: ["claude-bridge"],
+    capturedAt: now,
+    windows: [
+      {
+        id: "extra_usage",
+        label: "spend",
+        scope: { kind: "overage" },
+        usedPercent: 1.3888,
+        usedAmount: 69.44,
+        limitAmount: 5000,
+        currency: "USD",
+        resetsAt: 1793491200,
+        ...window,
+      },
+    ],
+  };
+}
+
+void test("formats a consumption account's spend window as money on the status line", () => {
+  const originalNow = Date.now;
+  Date.now = () => (1793491200 - 10 * 86_400) * 1000;
+  try {
+    assert.equal(
+      formatUsageStatusline(spendAdapterReport(), model("claude-bridge", "claude-sonnet", "Claude Sonnet")),
+      "Claude · spend $69.44/$5,000 1% ↻10d",
+    );
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+void test("a max account with credits active formats the same spend shape under the overage label", () => {
+  assert.equal(
+    formatUsageStatusline(
+      spendAdapterReport({ label: "overage", usedAmount: 12.5, limitAmount: 100, resetsAt: undefined }),
+      model("claude-bridge", "claude-sonnet", "Claude Sonnet"),
+    ),
+    "Claude · overage $12.50/$100.00 1%",
+  );
+});
+
+void test("omits the limit, the percent, and the countdown on the status line when each is absent", () => {
+  const noLimit = formatUsageStatusline(
+    spendAdapterReport({ limitAmount: undefined }),
+    model("claude-bridge", "claude-sonnet", "Claude Sonnet"),
+  );
+  assert.match(noLimit ?? "", /spend \$69\.44 1%/);
+  assert.doesNotMatch(noLimit ?? "", /\//);
+
+  const noPercent = formatUsageStatusline(
+    spendAdapterReport({ usedPercent: undefined }),
+    model("claude-bridge", "claude-sonnet", "Claude Sonnet"),
+  );
+  assert.equal(noPercent?.includes("spend $69.44/$5,000"), true);
+  assert.doesNotMatch(noPercent ?? "", /%/);
+
+  const noReset = formatUsageStatusline(
+    spendAdapterReport({ resetsAt: undefined }),
+    model("claude-bridge", "claude-sonnet", "Claude Sonnet"),
+  );
+  assert.doesNotMatch(noReset ?? "", /↻/);
+});
+
+void test("falls back to the plain label-and-percent form when no usedAmount is present", () => {
+  assert.equal(
+    formatUsageStatusline(
+      spendAdapterReport({ usedAmount: undefined, limitAmount: undefined, resetsAt: undefined }),
+      model("claude-bridge", "claude-sonnet", "Claude Sonnet"),
+    ),
+    "Claude · spend 1%",
+  );
+});
+
+void test("falls back to a plain number when the currency is unknown, absent, or invalid", () => {
+  const absent = formatUsageStatusline(
+    spendAdapterReport({ currency: undefined }),
+    model("claude-bridge", "claude-sonnet", "Claude Sonnet"),
+  );
+  assert.equal(absent?.includes("spend 69.44/5,000.00 1%"), true);
+
+  const invalid = formatUsageStatusline(
+    spendAdapterReport({ currency: "not-a-currency" }),
+    model("claude-bridge", "claude-sonnet", "Claude Sonnet"),
+  );
+  assert.equal(invalid?.includes("spend 69.44/5,000.00 1%"), true);
+});
+
+void test("/usage renders the spend window as money with a combined amount-and-reset parenthetical", () => {
+  const originalNow = Date.now;
+  Date.now = () => (1793491200 - 10 * 86_400) * 1000;
+  try {
+    const text = formatUsageReport(spendAdapterReport());
+    assert.match(text, />_ Claude Usage/);
+    assert.match(text, /Spend usage:/);
+    assert.match(text, /Spend:\s+.*1% used \(\$69\.44 of \$5,000\.00, resets /);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+void test("/usage uses the Overage group label and omits the limit/reset when absent", () => {
+  const text = formatUsageReport(spendAdapterReport({ label: "overage", limitAmount: undefined, resetsAt: undefined }));
+  assert.match(text, /Overage usage:/);
+  assert.match(text, /Overage:\s+.*1% used \(\$69\.44\)/);
+});
+
+void test("the /usage header carries the account label when one is known", () => {
+  const report: AdapterUsageReport = {
+    ...spendAdapterReport(),
+    account: { id: "c33cb52c", label: "fundamental@example.com" },
+  };
+  const text = formatUsageReport(report);
+  assert.match(text, />_ Claude Usage \(fundamental@example\.com\)/);
 });

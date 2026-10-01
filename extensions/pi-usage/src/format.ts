@@ -18,6 +18,7 @@ import {
   addNormalizedUsageKey,
   clampPercent,
   compactLimitLabel,
+  formatMoneyAmount,
   formatNumber,
   normalizedKeyHasToken,
   normalizedUsageKey,
@@ -138,9 +139,35 @@ function formatNormalizedUsageStatusline(
     }
     const percent = window.usedPercent === undefined ? "" : ` ${clampPercent(window.usedPercent).toFixed(0)}%`;
     const reset = formatResetCountdown(window.resetsAt);
-    return `${label}${percent}${reset ? ` ↻${reset}` : ""}`;
+    const resetSuffix = reset ? ` ↻${reset}` : "";
+    if (window.scope.kind === "overage" && window.usedAmount !== undefined) {
+      const money = formatSpendMoney(window.usedAmount, window.limitAmount, window.currency, statuslineLimitDecimals);
+      return `${label} ${money}${percent}${resetSuffix}`;
+    }
+    return `${label}${percent}${resetSuffix}`;
   });
   return [providerLabel ?? (provider === "claude" ? "Claude" : "Codex"), ...parts].join(" · ");
+}
+
+/** 0 decimals only for a whole-number limit of $1,000 or more (e.g. "$5,000");
+ * 2 decimals otherwise, matching the status line's compact style. */
+function statuslineLimitDecimals(limitAmount: number): number {
+  return Number.isInteger(limitAmount) && limitAmount >= 1000 ? 0 : 2;
+}
+
+function formatSpendMoney(
+  usedAmount: number,
+  limitAmount: number | undefined,
+  currency: string | undefined,
+  limitDecimals: (limitAmount: number) => number,
+): string {
+  const used = formatMoneyAmount(usedAmount, currency, 2);
+  if (limitAmount === undefined) return used;
+  return `${used}/${formatMoneyAmount(limitAmount, currency, limitDecimals(limitAmount))}`;
+}
+
+function capitalizeLabel(label: string): string {
+  return label.length === 0 ? label : `${label.charAt(0).toUpperCase()}${label.slice(1)}`;
 }
 
 function formatAdapterUsageReport(report: AdapterUsageReport): string {
@@ -170,7 +197,7 @@ function formatAdapterUsageReport(report: AdapterUsageReport): string {
         : window.scope.kind === "model"
           ? window.scope.label
           : window.scope.kind === "overage"
-            ? "Overage"
+            ? capitalizeLabel(window.label)
             : (window.scope.label ?? window.scope.id);
     const group = groups.get(key) ?? { label, windows: [] };
     group.windows.push(window);
@@ -183,7 +210,8 @@ function formatAdapterUsageReport(report: AdapterUsageReport): string {
     first = false;
     lines.push(`  ${group.label} usage:`);
     for (const window of group.windows) {
-      lines.push(formatNormalizedWindowLine(`${window.label}:`, window));
+      const lineLabel = window.scope.kind === "overage" ? capitalizeLabel(window.label) : window.label;
+      lines.push(formatNormalizedWindowLine(`${lineLabel}:`, window));
     }
   }
   return lines.join("\n");
@@ -376,6 +404,14 @@ function formatNormalizedWindowLine(label: string, window: NormalizedUsageWindow
     window.usedPercent === undefined
       ? USAGE_UNAVAILABLE_TEXT
       : `${progressBarUsed(window.usedPercent)} ${clampPercent(window.usedPercent).toFixed(0)}% used`;
+  if (window.scope.kind === "overage" && window.usedAmount !== undefined) {
+    const used = formatMoneyAmount(window.usedAmount, window.currency, 2);
+    const limit =
+      window.limitAmount === undefined ? undefined : formatMoneyAmount(window.limitAmount, window.currency, 2);
+    const detail = [limit === undefined ? used : `${used} of ${limit}`];
+    if (window.resetsAt !== undefined) detail.push(`resets ${formatReset(window.resetsAt)}`);
+    return `  ${label.padEnd(LIMIT_VALUE_COLUMN)}${utilization} (${detail.join(", ")})`;
+  }
   const reset = window.resetsAt ? ` (resets ${formatReset(window.resetsAt)})` : "";
   const amount =
     window.usedAmount === undefined
